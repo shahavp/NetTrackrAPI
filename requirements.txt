@@ -1,3 +1,8 @@
+# CPU-only PyTorch (keeps image ~2 GB instead of ~8 GB)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+
 # FastAPI + server
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
@@ -11,6 +16,3 @@ pandas>=2.0.0
 
 # Validation
 pydantic>=2.0.0
-
-# Client only (not needed in Docker)
-# requests>=2.31.0
