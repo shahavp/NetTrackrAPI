@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+*.md
+client.py
+docker-compose.yml
+.dockerignore
+railway.json
+*.mp4
+*.mov
+*.MOV
+*.avi
+run_output/
+.env
+.venv/

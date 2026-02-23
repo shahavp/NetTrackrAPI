@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+run_output/
+*.mp4
+*.mov
+*.MOV
+*.avi
+
+# Do NOT ignore cricket_yolov8/ — model weights must be in the repo
+# so Railway can bake them into the Docker image at build time.

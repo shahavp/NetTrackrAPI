@@ -1,0 +1,16 @@
+# FastAPI + server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# ML + CV
+ultralytics>=8.0.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Validation
+pydantic>=2.0.0
+
+# Client only (not needed in Docker)
+# requests>=2.31.0

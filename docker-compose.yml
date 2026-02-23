@@ -1,0 +1,21 @@
+# Local development only — Railway uses Dockerfile + railway.json directly.
+#
+#   docker compose up --build
+#   # API at http://localhost:8000
+
+version: "3.9"
+
+services:
+  tracker:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - MAX_UPLOAD_MB=100
+      - JOB_TTL_MINUTES=30
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
