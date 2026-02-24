@@ -33,10 +33,9 @@ from ultralytics import YOLO
 
 @dataclass
 class TrackerConfig:
-    """All tunable parameters.  Defaults match the standalone script."""
 
     # -- Paths --
-    model_path: str = "cricket_yolov8/best.pt"
+    model_path: str = "cricket_yolov8/best.onnx"
 
     # -- YOLO --
     imgsz: int = 1280
