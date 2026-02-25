@@ -39,7 +39,7 @@ class TrackerConfig:
 
     # -- YOLO --
     imgsz: int = 1280
-    conf: float = 0.2
+    conf: float = 0.15
     iou: float = 0.7
     device: Optional[str] = None
     classes: list[int] = field(default_factory=lambda: [0])
@@ -518,10 +518,7 @@ class CricketBallTracker:
 
     def warmup(self):
         """Pre-load the YOLO model so the first request is not slow."""
-        import time
-        t0 = time.time()
         self._get_model()
-        print(f"[tracker] Model loaded in {time.time() - t0:.1f}s: {self.cfg.model_path}")
         return self
 
     # ------------------------------------------------------------------
