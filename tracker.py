@@ -39,7 +39,7 @@ class TrackerConfig:
 
     # -- YOLO --
     imgsz: int = 1280
-    conf: float = 0.15
+    conf: float = 0.2
     iou: float = 0.7
     device: Optional[str] = None
     classes: list[int] = field(default_factory=lambda: [0])
