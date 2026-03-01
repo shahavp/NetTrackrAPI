@@ -47,7 +47,22 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from tracker import CricketBallTracker, TrackerConfig
+# IMPORTANT: We do NOT import tracker.py at module level.
+#
+#     from tracker import CricketBallTracker, TrackerConfig   ← DON'T DO THIS
+#
+# That single line triggers the entire heavyweight import chain:
+#     tracker.py → ultralytics → torch + torchvision → ~500 MB of RAM
+#     tracker.py → cv2, numpy, pandas                → ~100 MB more
+#
+# All of this happens BEFORE uvicorn can bind the port.  On Railway's
+# Trial plan (512 MB) it OOM-kills the process instantly.  Even on the
+# Hobby plan (8 GB), it blocks for 30-60 seconds of dead silence where
+# Railway's healthcheck gets connection-refused.
+#
+# Instead, we import tracker.py lazily inside _load_model() — which runs
+# in a background thread AFTER uvicorn has already bound the port and
+# started serving /health responses.
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +103,7 @@ VALID_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 #  Shared state
 # ---------------------------------------------------------------------------
 JOBS: dict[str, dict] = {}
-_tracker: CricketBallTracker | None = None   # singleton, loaded at startup
+_tracker = None   # CricketBallTracker singleton, loaded in background thread
 _model_ready = False
 _model_error: str | None = None              # set if model loading crashes
 
@@ -216,9 +231,13 @@ def _load_model():
     """Load the YOLO model in a background thread.
 
     Runs after uvicorn has bound the port so that /health is reachable
-    during loading.  Any exception is caught and stored in _model_error
-    so the health endpoint can report exactly what went wrong, rather
-    than the container silently crashing with no diagnostics.
+    during loading.  This function performs the LAZY IMPORT of tracker.py
+    (and therefore ultralytics, torch, cv2, numpy, pandas) — all ~600 MB
+    of dependencies load here, not at module import time.
+
+    Any exception is caught and stored in _model_error so the health
+    endpoint can report exactly what went wrong, rather than the container
+    silently crashing with no diagnostics.
     """
     global _tracker, _model_ready, _model_error
 
@@ -234,6 +253,12 @@ def _load_model():
                 f"Model weights not found at '{MODEL_PATH}'. "
                 f"Contents of parent dir: {list(weights.parent.iterdir()) if weights.parent.exists() else 'PARENT DIR MISSING'}"
             )
+
+        # LAZY IMPORT — this is where the heavy dependencies actually load.
+        # Importing tracker pulls in ultralytics → torch → ~500 MB.
+        # Doing it here (in a background thread, after yield) means the
+        # port is already bound and /health is already serving 503s.
+        from tracker import CricketBallTracker, TrackerConfig
 
         _tracker = CricketBallTracker(config=TrackerConfig(model_path=MODEL_PATH))
         _tracker.warmup()
@@ -314,17 +339,22 @@ def _progress_cb(job_id: str):
     return _cb
 
 
-def _get_tracker() -> CricketBallTracker:
+def _get_tracker():
     """Return the singleton tracker instance.
 
-    The YOLO model is loaded once during startup (in the lifespan hook)
-    and reused for every request.  TrackerConfig defaults are baked in
-    at startup — no per-request parameter changes.
+    The YOLO model is loaded once during startup (in the background
+    _load_model thread) and reused for every request.  TrackerConfig
+    defaults are baked in — no per-request parameter changes.
+
+    The fallback path (tracker is None) should only trigger during
+    testing or if _load_model somehow didn't run.  It lazy-imports
+    tracker.py since we don't import it at module level.
     """
     global _tracker
     if _tracker is None:
-        # Fallback in case lifespan didn't run (e.g. during testing).
-        # Uses TrackerConfig defaults with only model_path overridden.
+        # Fallback in case _load_model didn't run (e.g. during testing).
+        # Lazy import here too — tracker.py pulls in torch/ultralytics.
+        from tracker import CricketBallTracker, TrackerConfig
         _tracker = CricketBallTracker(config=TrackerConfig(model_path=MODEL_PATH))
         _tracker.warmup()
     return _tracker
