@@ -90,6 +90,7 @@ VALID_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 JOBS: dict[str, dict] = {}
 _tracker: CricketBallTracker | None = None   # singleton, loaded at startup
 _model_ready = False
+_model_error: str | None = None              # set if model loading crashes
 
 # Concurrency gate: only 1 video can be processed at a time.
 # YOLO inference + OpenCV frame buffers consume ~1-3 GB of RAM per job.
@@ -160,16 +161,30 @@ def _cleanup_job(job_id: str):
 async def lifespan(app: FastAPI):
     """Startup / shutdown hook for the FastAPI application.
 
-    Startup:
+    CRITICAL DESIGN DECISION — model loading happens AFTER yield:
+
+        The YOLO model takes 30–120 seconds to load on Railway's shared
+        CPU.  If we load it before yield, uvicorn won't bind the port
+        until loading finishes.  During that window Railway's healthcheck
+        gets connection-refused (not even a 503), which counts as a
+        failure — and if it exceeds startupTimeout the deploy is killed.
+
+        By yielding first, uvicorn binds the port immediately.  The
+        /health endpoint returns 503 ("Model still loading") which tells
+        Railway the container is alive but not ready.  Once the background
+        thread finishes loading, /health flips to 200.
+
+    Startup sequence:
         1. Create upload and output directories
-        2. Initialise the concurrency semaphore (must be inside the event loop)
-        3. Pre-load the YOLO model so /health can report readiness
-        4. Start the background cleanup thread
+        2. Initialise the concurrency semaphore (must be inside the loop)
+        3. yield — uvicorn binds the port, Railway can reach /health
+        4. Background thread loads the YOLO model
+        5. Background cleanup thread starts
 
     Shutdown:
         Log and exit — Railway handles container teardown.
     """
-    global _tracker, _model_ready, _processing_semaphore
+    global _processing_semaphore
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -181,22 +196,57 @@ async def lifespan(app: FastAPI):
     _processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
     log.info("Concurrency limit set to %d simultaneous job(s)", MAX_CONCURRENT_JOBS)
 
-    # Pre-load model so the first request is not slow and health check
-    # correctly reports readiness.  TrackerConfig uses sensible defaults
-    # for every parameter — we only override model_path.
-    log.info("Loading YOLO model from %s ...", MODEL_PATH)
-    _tracker = CricketBallTracker(config=TrackerConfig(model_path=MODEL_PATH))
-    _tracker.warmup()
-    _model_ready = True
-    log.info("Model ready — accepting requests")
+    # Spawn the model loader in a daemon thread so it runs AFTER yield.
+    # This lets uvicorn bind the port first, making /health reachable
+    # while the heavy YOLO import + weight load happens in parallel.
+    model_thread = threading.Thread(target=_load_model, daemon=True)
+    model_thread.start()
 
-    # Start cleanup daemon
-    t = threading.Thread(target=_cleanup_loop, daemon=True)
-    t.start()
+    # Start the periodic cleanup daemon
+    cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
+    cleanup_thread.start()
 
+    # Yield control — uvicorn binds the port NOW, Railway can healthcheck
     yield
 
     log.info("Shutting down")
+
+
+def _load_model():
+    """Load the YOLO model in a background thread.
+
+    Runs after uvicorn has bound the port so that /health is reachable
+    during loading.  Any exception is caught and stored in _model_error
+    so the health endpoint can report exactly what went wrong, rather
+    than the container silently crashing with no diagnostics.
+    """
+    global _tracker, _model_ready, _model_error
+
+    try:
+        log.info("Loading YOLO model from %s ...", MODEL_PATH)
+
+        # Verify the weights file actually exists before attempting to
+        # load — gives a clear error message instead of a cryptic
+        # ultralytics traceback.
+        weights = Path(MODEL_PATH)
+        if not weights.exists():
+            raise FileNotFoundError(
+                f"Model weights not found at '{MODEL_PATH}'. "
+                f"Contents of parent dir: {list(weights.parent.iterdir()) if weights.parent.exists() else 'PARENT DIR MISSING'}"
+            )
+
+        _tracker = CricketBallTracker(config=TrackerConfig(model_path=MODEL_PATH))
+        _tracker.warmup()
+        _model_ready = True
+        log.info("Model ready — accepting requests")
+
+    except Exception as e:
+        # Store the error so /health can report it.  The container stays
+        # alive (Railway won't get connection-refused), but /health will
+        # keep returning 503 with the error message, which is visible
+        # in the Railway dashboard logs.
+        _model_error = str(e)
+        log.error("Failed to load model: %s", e, exc_info=True)
 
 
 app = FastAPI(
@@ -365,6 +415,18 @@ async def _save_upload(video: UploadFile, video_path: Path):
 #  Endpoints
 # ---------------------------------------------------------------------------
 
+def _require_model_ready():
+    """Reject the request early if the YOLO model isn't loaded yet.
+
+    Called at the top of /track and /track/sync so we don't accept a
+    video upload only to fail when the pipeline tries to run inference.
+    Returns a clear 503 with the loading status or failure reason.
+    """
+    if not _model_ready:
+        if _model_error:
+            raise HTTPException(503, f"Model failed to load: {_model_error}")
+        raise HTTPException(503, "Model still loading, try again shortly")
+
 @app.post("/track", response_model=JobStatus)
 async def track_async(
     video: UploadFile = File(..., description="Video file (.mp4, .mov, .avi, .mkv, .webm)"),
@@ -376,6 +438,7 @@ async def track_async(
 
     All detection and tracking parameters use tested defaults.
     """
+    _require_model_ready()
     _validate_upload(video.filename, video.size or 0)
 
     job_id = str(uuid.uuid4())
@@ -471,6 +534,7 @@ async def track_sync(
 
     All detection and tracking parameters use tested defaults.
     """
+    _require_model_ready()
     _validate_upload(video.filename, video.size or 0)
     job_id = str(uuid.uuid4())
     video_path = UPLOAD_DIR / f"{job_id}.mp4"
@@ -536,6 +600,12 @@ async def health():
     model has finished loading.
     """
     if not _model_ready:
+        # Distinguish between "still loading" and "loading crashed" so
+        # the Railway dashboard logs tell the operator exactly what's
+        # happening.  Both return 503 (not ready), but the message
+        # makes debugging much faster.
+        if _model_error:
+            raise HTTPException(503, f"Model failed to load: {_model_error}")
         raise HTTPException(503, "Model still loading")
 
     # Calculate how many processing slots are currently free.
