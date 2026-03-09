@@ -1,0 +1,46 @@
+# =============================================================
+#  Cricket Ball Tracker — Railway "worker" service
+#  Heavy ML container; loads YOLO model once at startup.
+# =============================================================
+#
+# Railway-specific:
+#   • No public domain — private networking only
+#   • Single RQ worker process, one job at a time (--burst not set)
+#   • Model is loaded in the parent RQ process; forked children inherit it
+#     via copy-on-write, so disk I/O happens only on cold start
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# System deps for OpenCV + ffmpeg (same as original Dockerfile)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0t64 \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+        libgomp1 \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Full requirements (torch + ultralytics + rq + boto3)
+COPY requirements.txt requirements.worker.txt ./
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -r requirements.worker.txt
+
+# Application code (no api.py — worker doesn't serve HTTP)
+COPY tracker.py worker.py jobs.py storage.py ./
+
+# YOLO model weights baked into image
+COPY cricket_yolov8/ ./cricket_yolov8/
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# RQ worker listening on the "tracking" queue
+# --with-scheduler enables RQ's built-in scheduler (not used yet, harmless)
+CMD rq worker --url $REDIS_URL --with-scheduler tracking

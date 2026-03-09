@@ -1,21 +1,107 @@
-# Local development only — Railway uses Dockerfile + railway.json directly.
+# Local development — mirrors the Railway service topology.
 #
 #   docker compose up --build
-#   # API at http://localhost:8000
+#
+# Services:
+#   api     — stateless FastAPI on http://localhost:8000
+#   worker  — RQ worker (loads YOLO model)
+#   redis   — Redis 7 (job state + queue)
+#   minio   — S3-compatible local bucket (Railway Bucket replacement)
+#
+# MinIO console: http://localhost:9001  (user: minioadmin / minioadmin)
+# Create the "cricket" bucket in the console before first use, or run:
+#   docker compose exec minio mc alias set local http://localhost:9000 minioadmin minioadmin
+#   docker compose exec minio mc mb local/cricket
 
 version: "3.9"
 
+x-bucket-env: &bucket-env
+  BUCKET_NAME: cricket
+  BUCKET_ENDPOINT: http://minio:9000
+  BUCKET_ACCESS_KEY_ID: minioadmin
+  BUCKET_SECRET_ACCESS_KEY: minioadmin
+  BUCKET_REGION: us-east-1
+
 services:
-  tracker:
-    build: .
+
+  # ---------------------------------------------------------------------------
+  #  Redis
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  #  MinIO  (local Railway Bucket substitute)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  #  API service
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
     ports:
       - "8000:8000"
     environment:
-      - PORT=8000
-      - MAX_UPLOAD_MB=100
-      - JOB_TTL_MINUTES=30
+      PORT: "8000"
+      REDIS_URL: redis://redis:6379
+      MAX_UPLOAD_MB: "100"
+      JOB_TTL_SECONDS: "1800"
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:8000"
+      <<: *bucket-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  #  Worker service
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      REDIS_URL: redis://redis:6379
+      MODEL_PATH: cricket_yolov8/best.onnx
+      JOB_TTL_SECONDS: "1800"
+      WORKER_JOB_TIMEOUT: "1800"
+      <<: *bucket-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     deploy:
       resources:
         limits:
           cpus: "4"
           memory: 4G
+
+volumes:
+  minio_data:

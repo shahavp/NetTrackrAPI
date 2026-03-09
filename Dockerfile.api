@@ -1,0 +1,27 @@
+# =============================================================
+#  Cricket Ball Tracking API — Railway "api" service
+#  Stateless; no YOLO model, no torch, no OpenCV.
+# =============================================================
+#
+# Railway-specific:
+#   • Binds to $PORT (Railway injects this at runtime)
+#   • Multiple uvicorn workers (2) — safe because all state is in Redis/Bucket
+#   • Fast cold start (~10 s) because there is no model to load
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+COPY requirements.api.txt .
+RUN pip install --no-cache-dir -r requirements.api.txt
+
+COPY api.py jobs.py queue.py storage.py ./
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# 2 workers — safe because the service is fully stateless
+CMD uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2 --timeout-keep-alive 30

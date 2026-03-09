@@ -1,0 +1,9 @@
+# Additional worker dependencies (installed on top of requirements.txt).
+# requirements.txt provides torch + ultralytics + opencv + numpy + pandas.
+
+# Redis job state + RQ worker
+redis>=5.0.0
+rq>=1.16.0
+
+# S3-compatible bucket client (Railway Bucket)
+boto3>=1.34.0

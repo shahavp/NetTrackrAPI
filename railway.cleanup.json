@@ -5,20 +5,15 @@
     "dockerfilePath": "./Dockerfile.api",
     "watchPatterns": [
       "requirements.api.txt",
-      "api.py",
+      "cleanup.py",
       "jobs.py",
-      "queue.py",
       "storage.py",
       "Dockerfile.api",
-      "railway.json"
+      "railway.cleanup.json"
     ]
   },
   "deploy": {
-    "healthcheckPath": "/health",
-    "healthcheckTimeout": 60,
-    "startupTimeout": 60,
-    "restartPolicyType": "always",
-    "restartPolicyMaxRetries": 5,
-    "numReplicas": 2
+    "cronSchedule": "0 * * * *",
+    "restartPolicyType": "never"
   }
 }
