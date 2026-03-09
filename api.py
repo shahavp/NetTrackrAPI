@@ -42,7 +42,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 import jobs
-import queue as q
+import task_queue as q
 import storage
 
 # ---------------------------------------------------------------------------

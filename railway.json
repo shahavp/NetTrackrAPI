@@ -7,7 +7,7 @@
       "requirements.api.txt",
       "api.py",
       "jobs.py",
-      "queue.py",
+      "task_queue.py",
       "storage.py",
       "Dockerfile.api",
       "railway.json"
