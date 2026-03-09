@@ -18,7 +18,7 @@ WORKDIR /app
 COPY requirements.api.txt .
 RUN pip install --no-cache-dir -r requirements.api.txt
 
-COPY api.py jobs.py queue.py storage.py ./
+COPY api.py jobs.py queue.py storage.py cleanup.py ./
 
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser

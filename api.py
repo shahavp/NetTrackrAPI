@@ -11,7 +11,7 @@ Key differences from main.py
 * Uploads are streamed to the Railway Bucket via server-side PUT;
   downloads redirect to presigned bucket URLs, never proxied through the API.
 * /track/sync is removed — every request becomes a queued job.
-* CORS wildcard subdomain is handled via allow_origin_regex, not allow_origins.
+* No CORS middleware — all clients are native mobile apps, not browsers.
 
 Endpoints
 ---------
@@ -29,9 +29,7 @@ Environment variables (set via Railway reference variables)
   REDIS_URL
   BUCKET_NAME, BUCKET_ENDPOINT, BUCKET_ACCESS_KEY_ID,
   BUCKET_SECRET_ACCESS_KEY, BUCKET_REGION
-  MAX_UPLOAD_MB        (default 100)
-  ALLOWED_ORIGINS      comma-separated exact origins for CORS
-  ALLOWED_ORIGIN_REGEX regex for CORS wildcard domains
+  MAX_UPLOAD_MB  (default 100)
 """
 
 import logging
@@ -39,40 +37,13 @@ import os
 import uuid
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import RedirectResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 import jobs
 import queue as q
 import storage
-
-# ---------------------------------------------------------------------------
-#  Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("cricket-api")
-
-# ---------------------------------------------------------------------------
-#  Config
-# ---------------------------------------------------------------------------
-MAX_UPLOAD_MB   = int(os.getenv("MAX_UPLOAD_MB", "100"))
-VALID_EXT       = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-
-# Exact origins (e.g. localhost dev).  Wildcard subdomain matching
-# uses allow_origin_regex below — NOT a literal entry here.
-_EXACT_ORIGINS = [
-    o.strip()
-    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
-    if o.strip()
-]
-# Matches any https://*.railway.app origin without the broken wildcard literal
-_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", r"https://.*\.railway\.app")
 
 # ---------------------------------------------------------------------------
 #  Pydantic models
@@ -103,16 +74,6 @@ app = FastAPI(
     ),
     version="3.0.0",
 )
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_EXACT_ORIGINS,
-    allow_origin_regex=_ORIGIN_REGEX,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 # ---------------------------------------------------------------------------
 #  Helpers
