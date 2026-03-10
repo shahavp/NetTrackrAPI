@@ -45,6 +45,13 @@ import jobs
 import task_queue as q
 import storage
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("cricket-api")
+
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
 VALID_EXT     = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
