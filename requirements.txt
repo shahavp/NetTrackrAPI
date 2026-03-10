@@ -14,6 +14,8 @@ opencv-python-headless>=4.8.0
 numpy>=1.24.0
 pandas>=2.0.0
 lap
+onnx>=1.14.0
+onnxruntime>=1.16.0
 
 # Validation
 pydantic>=2.0.0
