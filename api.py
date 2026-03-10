@@ -45,6 +45,9 @@ import jobs
 import task_queue as q
 import storage
 
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
+VALID_EXT     = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
 # ---------------------------------------------------------------------------
 #  Pydantic models
 # ---------------------------------------------------------------------------
