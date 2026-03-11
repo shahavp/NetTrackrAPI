@@ -8,9 +8,10 @@ importable module (FastAPI, scripts, notebooks).
     tracker = CricketBallTracker(config)
     result  = tracker.process_video(video_path, out_dir, progress_cb)
 
-Pass 1 — YOLO + ByteTrack + momentum-gated tracking + HSV recovery
-Pass 2 — Bounce-first per-segment RANSAC + two-parabola fitting +
-          post-bounce extension + perspective-scaled rendering
+Pass 1 — YOLO + ByteTrack + Euclidean-gated tracking + HSV recovery
+Pass 2 — IMM+UKF speed estimation + parabolic smoothing + trajectory overlay
+
+Based on hsv_imm_pipeline.py (merged reference implementation).
 """
 
 from __future__ import annotations
@@ -24,11 +25,12 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 import pandas as pd
+from scipy.linalg import cholesky
 from ultralytics import YOLO
 
 
 # =====================================================================
-#  CONFIGURATION (dataclass — every constant is overridable)
+#  CONFIGURATION
 # =====================================================================
 
 @dataclass
@@ -38,8 +40,8 @@ class TrackerConfig:
     model_path: str = "cricket_yolov8/best.onnx"
 
     # -- YOLO --
-    imgsz: int = 1280
-    conf: float = 0.2
+    imgsz: int = 1280  # Must be 1280 to ensure accuracy
+    conf: float = 0.15
     iou: float = 0.7
     device: Optional[str] = None
     classes: list[int] = field(default_factory=lambda: [0])
@@ -55,17 +57,10 @@ class TrackerConfig:
     gate_radius_px: int = 80
     gate_grow_per_miss: int = 15
     max_misses: int = 60
-
-    # -- Momentum --
-    vel_ema_momentum: float = 0.85
-    vel_min_disp_px: float = 2.0
-    gate_along_ratio: float = 1.3
-    gate_perp_ratio: float = 0.6
-    size_ratio_max: float = 3.0
-    size_ema_momentum: float = 0.8
-
-    # -- False-positive filtering --
     min_box_area_px: int = 25
+
+    # -- Velocity EMA (alpha=0.3 → 0.7*old + 0.3*new) --
+    vel_ema_alpha: float = 0.3
 
     # -- HSV recovery --
     enable_hsv_recovery: bool = True
@@ -82,34 +77,45 @@ class TrackerConfig:
     hsv_morph_kernel: int = 3
     hsv_morph_iters: int = 1
 
-    # -- Trajectory fitting --
+    # -- Trajectory --
     traj_min_points: int = 5
-    traj_ransac_iters: int = 60
-    traj_ransac_inlier_px: float = 10.0
     traj_bounce_thresh: int = 8
     traj_angle_cutoff: int = 45
-    traj_post_bounce_extend: float = 0.4
-    traj_min_post_bounce: int = 3
-    traj_max_frame_gap: int = 6
 
-    # -- Rendering --
-    traj_thickness_max: int = 6
-    traj_thickness_min: int = 1
-    traj_dot_max: int = 6
-    traj_dot_min: int = 2
-    traj_bounce_ring_r1: int = 14
-    traj_bounce_ring_r2: int = 9
+    # -- Overlay --
+    line_color: tuple = (0, 140, 255)  # BGR orange
 
-    # Colours (BGR)
-    colour_start: tuple = (100, 220, 60)
-    colour_mid: tuple = (40, 200, 240)
-    colour_end: tuple = (30, 80, 240)
-    colour_bounce: tuple = (0, 100, 255)
 
-    # -- Output control --
-    save_annotated_video: bool = True
-    save_trajectory_video: bool = True
-    save_trajectory_csv: bool = True
+# =====================================================================
+#  CONSTANTS  (camera, physics, IMM — from hsv_imm_pipeline.py)
+# =====================================================================
+
+_GRAVITY      = 9.81
+_BALL_RADIUS  = 0.036
+
+_CAM_FOCAL_PX  = 1371.0
+_CAM_CX        = 960.0
+_CAM_CY        = 540.0
+_CAM_POS_WORLD = np.array([-2.0, 0.0, 0.71])
+_CAM_TILT_DEG  = 5.0
+
+_BOUNCE_E_NORMAL     = 0.55
+_BOUNCE_E_TANGENTIAL = 0.92
+
+_UKF_ALPHA = 1e-3
+_UKF_BETA  = 2.0
+_UKF_KAPPA = 0.0
+
+_MEAS_SIGMA_DET  = 3.0
+_MEAS_SIGMA_HSV  = 8.0
+_MEAS_SIGMA_NONE = 1e6
+
+_IMM_TRANSITION = np.array([
+    [0.93, 0.03, 0.00, 0.04],
+    [0.00, 0.20, 0.75, 0.05],
+    [0.00, 0.00, 0.94, 0.06],
+    [0.12, 0.03, 0.15, 0.70],
+])
 
 
 # =====================================================================
@@ -132,11 +138,14 @@ def _write_bytetrack_yaml(path: Path, cfg: TrackerConfig):
 def _area(x1, y1, x2, y2):
     return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
+
 def _center(x1, y1, x2, y2):
     return (0.5 * (x1 + x2), 0.5 * (y1 + y2))
 
+
 def _clip(v, lo, hi):
     return int(max(lo, min(hi, v)))
+
 
 def _roi(cx, cy, half, w, h):
     x1 = _clip(cx - half, 0, w - 1); y1 = _clip(cy - half, 0, h - 1)
@@ -146,38 +155,6 @@ def _roi(cx, cy, half, w, h):
     return x1, y1, x2, y2
 
 
-def _lerp_colour(c1, c2, t):
-    t = max(0.0, min(1.0, t))
-    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
-
-
-def _traj_colour(index, total, cfg: TrackerConfig):
-    if total <= 1:
-        return cfg.colour_mid
-    t = index / (total - 1)
-    if t < 0.5:
-        return _lerp_colour(cfg.colour_start, cfg.colour_mid, t * 2.0)
-    return _lerp_colour(cfg.colour_mid, cfg.colour_end, (t - 0.5) * 2.0)
-
-
-# =====================================================================
-#  ELLIPTICAL GATING
-# =====================================================================
-
-def _elliptical_gate_dist(cand_xy, pred_xy, vel, gate, cfg: TrackerConfig):
-    dx = cand_xy[0] - pred_xy[0]
-    dy = cand_xy[1] - pred_xy[1]
-    speed = math.hypot(vel[0], vel[1])
-    if speed < 1.0:
-        return math.hypot(dx, dy) / gate if gate > 0 else float("inf")
-    ux, uy = vel[0] / speed, vel[1] / speed
-    d_along = dx * ux + dy * uy
-    d_perp = -dx * uy + dy * ux
-    a = max(1.0, gate * cfg.gate_along_ratio)
-    b = max(1.0, gate * cfg.gate_perp_ratio)
-    return math.sqrt((d_along / a) ** 2 + (d_perp / b) ** 2)
-
-
 # =====================================================================
 #  HSV COLOUR RECOVERY
 # =====================================================================
@@ -185,8 +162,8 @@ def _elliptical_gate_dist(cand_xy, pred_xy, vel, gate, cfg: TrackerConfig):
 def _learn_hsv(frame, xyxy, cfg: TrackerConfig):
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = map(int, xyxy)
-    x1 = _clip(x1, 0, w - 1); x2 = _clip(x2, 0, w - 1)
-    y1 = _clip(y1, 0, h - 1); y2 = _clip(y2, 0, h - 1)
+    x1 = _clip(x1, 0, w-1); x2 = _clip(x2, 0, w-1)
+    y1 = _clip(y1, 0, h-1); y2 = _clip(y2, 0, h-1)
     if x2 <= x1 or y2 <= y1:
         return None
     crop = frame[y1:y2, x1:x2]
@@ -212,8 +189,8 @@ def _learn_hsv(frame, xyxy, cfg: TrackerConfig):
         ranges = [((h_lo, s_lo, v_lo), (h_hi, s_hi, v_hi))]
     else:
         ranges = [
-            ((0, s_lo, v_lo), (h_hi, s_hi, v_hi)),
-            ((h_lo, s_lo, v_lo), (179, s_hi, v_hi)),
+            ((0,    s_lo, v_lo), (h_hi, s_hi, v_hi)),
+            ((h_lo, s_lo, v_lo), (179,  s_hi, v_hi)),
         ]
     return {"hue_ranges": ranges}
 
@@ -223,8 +200,8 @@ def _hsv_blob(frame, roi_xyxy, model, pred_xy, cfg: TrackerConfig):
         return None
     H, W = frame.shape[:2]
     rx1, ry1, rx2, ry2 = map(int, roi_xyxy)
-    rx1 = _clip(rx1, 0, W - 1); rx2 = _clip(rx2, 0, W - 1)
-    ry1 = _clip(ry1, 0, H - 1); ry2 = _clip(ry2, 0, H - 1)
+    rx1 = _clip(rx1, 0, W-1); rx2 = _clip(rx2, 0, W-1)
+    ry1 = _clip(ry1, 0, H-1); ry2 = _clip(ry2, 0, H-1)
     if rx2 <= rx1 or ry2 <= ry1:
         return None
     roi = frame[ry1:ry2, rx1:rx2]
@@ -240,7 +217,7 @@ def _hsv_blob(frame, roi_xyxy, model, pred_xy, cfg: TrackerConfig):
     k = cfg.hsv_morph_kernel
     if k >= 3:
         kern = np.ones((k, k), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kern, iterations=cfg.hsv_morph_iters)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kern, iterations=cfg.hsv_morph_iters)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern, iterations=cfg.hsv_morph_iters)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best = None; best_score = float("inf")
@@ -269,35 +246,308 @@ def _hsv_blob(frame, roi_xyxy, model, pred_xy, cfg: TrackerConfig):
 
 
 # =====================================================================
-#  PASS 2 — TRAJECTORY FITTING
+#  CAMERA MODEL
 # =====================================================================
 
-def _trim_at_gap(frames, x, y, max_gap):
-    for i in range(1, len(frames)):
-        if frames[i] - frames[i - 1] > max_gap:
-            return frames[:i], x[:i], y[:i]
-    return frames, x, y
+class CameraModel:
+    """Pinhole camera for behind-the-stumps view."""
+
+    def __init__(self):
+        self.fx = _CAM_FOCAL_PX
+        self.fy = _CAM_FOCAL_PX
+        self.cx = _CAM_CX
+        self.cy = _CAM_CY
+
+        R_base = np.array([
+            [0.0,  1.0,  0.0],
+            [0.0,  0.0, -1.0],
+            [1.0,  0.0,  0.0],
+        ])
+        t_rad = np.radians(_CAM_TILT_DEG)
+        R_tilt = np.array([
+            [1.0, 0.0,            0.0           ],
+            [0.0, np.cos(t_rad), -np.sin(t_rad) ],
+            [0.0, np.sin(t_rad),  np.cos(t_rad) ],
+        ])
+        self.R = R_tilt @ R_base
+        self.t = -self.R @ _CAM_POS_WORLD
+
+    def project(self, p_world):
+        """3D world point → 2D pixel (u, v)."""
+        p_cam = self.R @ p_world + self.t
+        if p_cam[2] <= 0.01:
+            p_cam[2] = 0.01
+        u = self.fx * p_cam[0] / p_cam[2] + self.cx
+        v = self.fy * p_cam[1] / p_cam[2] + self.cy
+        return np.array([u, v])
+
+    def back_project_ray(self, u, v):
+        """Pixel (u,v) → unit ray direction in world coords."""
+        ray_cam = np.array([(u - self.cx)/self.fx, (v - self.cy)/self.fy, 1.0])
+        ray_cam /= np.linalg.norm(ray_cam)
+        ray_world = self.R.T @ ray_cam
+        return ray_world / np.linalg.norm(ray_world)
 
 
-def _detect_bounce(y_raw, thresh, min_pts):
-    n = len(y_raw)
-    if n < min_pts:
+# =====================================================================
+#  UKF / IMM
+# =====================================================================
+
+def _sigma_points(x, P):
+    """Scaled unscented transform sigma points."""
+    n   = len(x)
+    lam = _UKF_ALPHA**2 * (n + _UKF_KAPPA) - n
+    try:
+        S = cholesky((n + lam) * P, lower=True)
+    except np.linalg.LinAlgError:
+        S = cholesky((n + lam) * (P + 1e-8*np.eye(n)), lower=True)
+    pts = np.zeros((2*n+1, n))
+    pts[0] = x
+    for i in range(n):
+        pts[i+1]   = x + S[:, i]
+        pts[n+i+1] = x - S[:, i]
+    Wm = np.full(2*n+1, 1.0/(2*(n+lam)))
+    Wc = np.full(2*n+1, 1.0/(2*(n+lam)))
+    Wm[0] = lam/(n+lam)
+    Wc[0] = lam/(n+lam) + (1 - _UKF_ALPHA**2 + _UKF_BETA)
+    return pts, Wm, Wc
+
+
+def _f_ballistic(x, dt):
+    """Ballistic dynamics: constant velocity + gravity."""
+    X, Y, Z, VX, VY, VZ = x
+    return np.array([
+        X + VX*dt,
+        Y + VY*dt,
+        Z + VZ*dt - 0.5*_GRAVITY*dt**2,
+        VX,
+        VY,
+        VZ - _GRAVITY*dt,
+    ])
+
+
+def _f_bounce(x, dt):
+    """Bounce dynamics: apply restitution near ground, then ballistic."""
+    X, Y, Z, VX, VY, VZ = x
+    if Z <= _BALL_RADIUS + 0.05 and VZ < 0:
+        VZ = -_BOUNCE_E_NORMAL * VZ
+        VX =  _BOUNCE_E_TANGENTIAL * VX
+        VY =  _BOUNCE_E_TANGENTIAL * VY
+        Z  = max(_BALL_RADIUS, Z)
+    return np.array([
+        X + VX*dt, Y + VY*dt,
+        Z + VZ*dt - 0.5*_GRAVITY*dt**2,
+        VX, VY, VZ - _GRAVITY*dt,
+    ])
+
+
+class UKFMode:
+    """One UKF instance for one IMM mode. Holds its own state, covariance, Q."""
+
+    def __init__(self, name, f_func, Q, x0, P0, cam):
+        self.name = name
+        self.f    = f_func
+        self.Q    = Q.copy()
+        self.x    = x0.copy()
+        self.P    = P0.copy()
+        self.cam  = cam
+        self.lik  = 1.0
+
+    def predict(self, dt):
+        sig, Wm, Wc = _sigma_points(self.x, self.P)
+        sig_pred = np.array([self.f(sig[i], dt) for i in range(len(sig))])
+        self.x = np.sum(Wm[:,None] * sig_pred, axis=0)
+        self.P = self.Q.copy()
+        for i in range(len(sig)):
+            d = sig_pred[i] - self.x
+            self.P += Wc[i] * np.outer(d, d)
+
+    def update(self, z, R):
+        """Kalman update with pixel measurement z=[u,v]."""
+        sig, Wm, Wc = _sigma_points(self.x, self.P)
+        z_sig  = np.array([self.cam.project(sig[i, :3]) for i in range(len(sig))])
+        z_pred = np.sum(Wm[:,None] * z_sig, axis=0)
+        S = R.copy(); Pxz = np.zeros((6, 2))
+        for i in range(len(sig)):
+            dz = z_sig[i] - z_pred; dx = sig[i] - self.x
+            S   += Wc[i] * np.outer(dz, dz)
+            Pxz += Wc[i] * np.outer(dx, dz)
+        S_inv = np.linalg.inv(S)
+        K     = Pxz @ S_inv
+        innov = z - z_pred
+        maha  = float(innov @ S_inv @ innov)
+        self.x = self.x + K @ innov
+        self.P = self.P - K @ S @ K.T
+        self.P = 0.5*(self.P + self.P.T)
+        det_S   = max(np.linalg.det(S), 1e-30)
+        self.lik = float(np.exp(-0.5*maha) / np.sqrt((2*np.pi)**2 * det_S))
+        return maha
+
+
+class IMMFilter:
+    """Four-mode IMM: pre_bounce, bounce, post_bounce, occluded."""
+
+    def __init__(self, cam, x0, P0, fps):
+        self.cam = cam
+        self.dt  = 1.0 / fps
+        self.N   = 4
+        self.mu  = np.array([0.88, 0.02, 0.02, 0.08])
+        self.Ptr = _IMM_TRANSITION.copy()
+
+        Q_pre  = np.diag([0.01, 0.005, 0.005, 0.5,  0.3,  0.5 ])
+        Q_bnc  = np.diag([0.05, 0.02,  0.02,  15.0, 5.0,  25.0])
+        Q_post = np.diag([0.02, 0.01,  0.01,  1.0,  0.5,  1.0 ])
+        Q_occ  = np.diag([0.05, 0.02,  0.02,  2.0,  1.0,  2.0 ])
+
+        self.modes = [
+            UKFMode("pre_bounce",  _f_ballistic, Q_pre,  x0, P0, cam),
+            UKFMode("bounce",      _f_bounce,    Q_bnc,  x0, P0, cam),
+            UKFMode("post_bounce", _f_ballistic, Q_post, x0, P0, cam),
+            UKFMode("occluded",    _f_ballistic, Q_occ,  x0, P0, cam),
+        ]
+
+    def _mix(self):
+        c = np.zeros(self.N)
+        for j in range(self.N):
+            for i in range(self.N):
+                c[j] += self.Ptr[i, j] * self.mu[i]
+            c[j] = max(c[j], 1e-30)
+        omega = np.zeros((self.N, self.N))
+        for i in range(self.N):
+            for j in range(self.N):
+                omega[i, j] = self.Ptr[i, j] * self.mu[i] / c[j]
+        for j in range(self.N):
+            x_mix = sum(omega[i, j]*self.modes[i].x for i in range(self.N))
+            P_mix = np.zeros((6, 6))
+            for i in range(self.N):
+                d = self.modes[i].x - x_mix
+                P_mix += omega[i, j] * (self.modes[i].P + np.outer(d, d))
+            self.modes[j].x = x_mix
+            self.modes[j].P = P_mix
+        return c
+
+    def _bounce_guards(self):
+        x = self.fused_state()
+        Z, VZ = x[2], x[5]
+        if Z > 0.40 or VZ > 0: self.mu[1] *= 0.01
+        if self.mu[2] > 0.6:   self.mu[0] *= 0.01
+        total = self.mu.sum()
+        if total > 1e-30: self.mu /= total
+
+    def step(self, z, R, status, misses_count):
+        c = self._mix()
+        for m in self.modes:
+            m.predict(self.dt)
+        use_meas = (z is not None) and (status in ('det', 'hsv'))
+        if use_meas:
+            for m in self.modes:
+                maha = m.update(z, R)
+                if maha > 16.0: m.lik *= 0.01
+        else:
+            for m in self.modes: m.lik = 1.0
+            if status in ('pred', 'miss'):
+                self.mu[3] = min(0.95, self.mu[3] * 1.3)
+            if misses_count > 5:
+                self.mu[3] = min(0.95, self.mu[3] * 1.5)
+        for j in range(self.N):
+            self.mu[j] = self.modes[j].lik * c[j]
+        total = self.mu.sum()
+        if total > 1e-30: self.mu /= total
+        else: self.mu = np.ones(self.N)/self.N
+        self._bounce_guards()
+
+    def fused_state(self):
+        return sum(self.mu[j]*self.modes[j].x for j in range(self.N))
+
+    def speed_mps(self):
+        x = self.fused_state()
+        return float(np.sqrt(x[3]**2 + x[4]**2 + x[5]**2))
+
+    def dominant_mode(self):
+        names = ["pre_bounce", "bounce", "post_bounce", "occluded"]
+        return names[int(np.argmax(self.mu))]
+
+
+def _init_3d_state(obs_list, cam, fps):
+    n   = min(6, len(obs_list))
+    obs = obs_list[:n]
+    u_avg = np.mean([o['u'] for o in obs])
+    v_avg = np.mean([o['v'] for o in obs])
+    ray   = cam.back_project_ray(u_avg, v_avg)
+    t_ray = 18.0 / ray[0] if abs(ray[0]) > 1e-4 else 18.0
+    p     = _CAM_POS_WORLD + t_ray * ray
+    p[0]  = np.clip(p[0], 10.0, 22.0)
+    p[1]  = np.clip(p[1], -2.0,  2.0)
+    p[2]  = np.clip(p[2],  1.0,  2.8)
+    speed = 35.0
+    if n >= 2:
+        du  = obs[-1]['u'] - obs[0]['u']
+        dv  = obs[-1]['v'] - obs[0]['v']
+        vz  = np.clip(-2.0 + (-dv/max(abs(du), 1))*3.0, -5.0, 5.0)
+        vy  = np.clip((du/max(abs(du)+abs(dv), 1))*2.0, -3.0, 3.0)
+        vx  = -np.sqrt(max(speed**2 - vy**2 - vz**2, 100.0))
+    else:
+        vx, vy, vz = -35.0, 0.0, -1.5
+    x0 = np.array([p[0], p[1], p[2], vx, vy, vz])
+    P0 = np.diag([4.0, 1.0, 0.5, 50.0, 10.0, 10.0])
+    return x0, P0
+
+
+# =====================================================================
+#  TRAJECTORY FUNCTIONS
+# =====================================================================
+
+def _fit_parabola(x, y):
+    if len(x) < 3:
         return None
+    try:
+        return np.polyfit(x, y, 2)
+    except Exception:
+        return None
+
+
+def _smooth_trajectory(x_raw, y_raw, min_points, bounce_thresh):
+    """Parabolic smoothing with bounce detection. Returns (x, y, bounce_pt)."""
+    n = len(x_raw)
+    if n < min_points:
+        return x_raw.copy(), y_raw.copy(), None
+
+    bounce_idx = None
     dy = np.diff(y_raw)
     for i in range(2, len(dy) - 1):
-        if dy[i - 1] > 0 and dy[i] < 0:
-            local = y_raw[max(0, i - 2): min(n, i + 3)]
-            if np.ptp(local) > thresh:
-                return i
-    return None
+        if dy[i-1] > 0 and dy[i] < 0:
+            local_range = y_raw[max(0, i-2):min(n, i+3)]
+            if np.ptp(local_range) > bounce_thresh:
+                bounce_idx = i
+                break
+
+    if bounce_idx is None:
+        coeffs = _fit_parabola(x_raw, y_raw)
+        if coeffs is not None:
+            return x_raw.copy(), np.polyval(coeffs, x_raw), None
+        return x_raw.copy(), y_raw.copy(), None
+
+    x_pre, y_pre   = x_raw[:bounce_idx+1], y_raw[:bounce_idx+1]
+    x_post, y_post = x_raw[bounce_idx:],   y_raw[bounce_idx:]
+
+    coeffs_pre  = _fit_parabola(x_pre, y_pre)
+    coeffs_post = _fit_parabola(x_post, y_post)
+
+    y_smooth_pre  = np.polyval(coeffs_pre,  x_pre)  if coeffs_pre  is not None else y_pre.copy()
+    y_smooth_post = np.polyval(coeffs_post, x_post) if coeffs_post is not None else y_post.copy()
+
+    x_smooth  = np.concatenate([x_pre, x_post[1:]])
+    y_smooth  = np.concatenate([y_smooth_pre, y_smooth_post[1:]])
+    bounce_pt = (x_raw[bounce_idx], float(y_smooth_pre[-1]))
+    return x_smooth, y_smooth, bounce_pt
 
 
 def _find_cutoff(x, y, bounce_idx, angle_cutoff):
     if bounce_idx is None:
         return len(x) - 1
     for i in range(bounce_idx + 2, len(x) - 1):
-        v1 = np.array([x[i] - x[i - 1], y[i] - y[i - 1]])
-        v2 = np.array([x[i + 1] - x[i], y[i + 1] - y[i]])
+        v1 = np.array([x[i] - x[i-1], y[i] - y[i-1]])
+        v2 = np.array([x[i+1] - x[i], y[i+1] - y[i]])
         m1, m2 = np.linalg.norm(v1), np.linalg.norm(v2)
         if m1 < 0.5 or m2 < 0.5:
             continue
@@ -307,195 +557,159 @@ def _find_cutoff(x, y, bounce_idx, angle_cutoff):
     return len(x) - 1
 
 
-def _ransac_filter(x, y, n_iters, threshold, min_pts):
-    n = len(x)
-    if n < 4:
-        return np.ones(n, dtype=bool)
-    best = np.zeros(n, dtype=bool); best_cnt = 0
-    for _ in range(n_iters):
-        idx = np.random.choice(n, 3, replace=False)
-        if len(set(x[idx])) < 3:
-            continue
-        try:
-            c = np.polyfit(x[idx], y[idx], 2)
-        except np.linalg.LinAlgError:
-            continue
-        inl = np.abs(y - np.polyval(c, x)) < threshold
-        cnt = inl.sum()
-        if cnt > best_cnt:
-            best_cnt = cnt; best = inl
-    if best_cnt < min(min_pts, n):
-        return np.ones(n, dtype=bool)
-    return best
-
-
-def _fit_parabola(x, y):
-    if len(x) < 3:
-        return None
-    try:
-        return np.polyfit(x, y, 2)
-    except np.linalg.LinAlgError:
-        return None
-
-
-def _fit_two_parabolas(x_raw, y_raw, bounce_idx, cutoff_idx, cfg: TrackerConfig):
-    # Pre-bounce
-    xp = x_raw[:bounce_idx + 1]; yp = y_raw[:bounce_idx + 1]
-    mp = _ransac_filter(xp, yp, cfg.traj_ransac_iters, cfg.traj_ransac_inlier_px, cfg.traj_min_points)
-    xpc = xp[mp]; ypc = yp[mp]
-    cp = _fit_parabola(xpc, ypc)
-    ypf = np.polyval(cp, xpc) if cp is not None else ypc.copy()
-
-    # Post-bounce
-    pe = min(cutoff_idx + 1, len(x_raw))
-    xq = x_raw[bounce_idx:pe]; yq = y_raw[bounce_idx:pe]
-    cq = None; xqc = xq.copy(); yqf = yq.copy()
-    x_ext = np.array([]); y_ext = np.array([])
-
-    if len(xq) >= cfg.traj_min_post_bounce:
-        mq = _ransac_filter(xq, yq, cfg.traj_ransac_iters, cfg.traj_ransac_inlier_px, cfg.traj_min_points)
-        xqc = xq[mq]; yqc = yq[mq]
-        if len(xqc) >= cfg.traj_min_post_bounce:
-            cq = _fit_parabola(xqc, yqc)
-        if cq is not None:
-            yqf = np.polyval(cq, xqc)
-            span = xqc[-1] - xqc[0]
-            if span > 1.0:
-                ed = span * cfg.traj_post_bounce_extend
-                xe = np.linspace(xqc[-1], xqc[-1] + ed, 20)
-                ye = np.polyval(cq, xe)
-                good = np.ones(len(xe), dtype=bool)
-                for j in range(1, len(xe)):
-                    if ye[j] > ye[j - 1] or ye[j] < 0:
-                        good[j:] = False; break
-                if good.any():
-                    x_ext = xe[good]; y_ext = ye[good]
-        else:
-            xqc = xq.copy(); yqf = yq.copy()
-
-    by = ypf[-1] if cp is not None else y_raw[bounce_idx]
-    bp = (float(x_raw[bounce_idx]), float(by))
-    return cp, cq, xpc, ypf, xqc, yqf, x_ext, y_ext, bp
-
-
-def _interp_dense(cp, cq, xp, ypf, xq, yqf, x_ext, y_ext, density=4):
-    if cp is not None and len(xp) >= 2:
-        xd1 = np.linspace(xp[0], xp[-1], max(len(xp) * density, 2))
-        yd1 = np.polyval(cp, xd1)
-    else:
-        xd1 = xp.astype(float); yd1 = ypf.astype(float)
-    bi = len(xd1) - 1
-    if cq is not None and len(xq) >= 2:
-        xd2 = np.linspace(xq[0], xq[-1], max(len(xq) * density, 2))
-        yd2 = np.polyval(cq, xd2)
-    else:
-        xd2 = xq.astype(float); yd2 = yqf.astype(float)
-    xd = np.concatenate([xd1, xd2[1:]]); yd = np.concatenate([yd1, yd2[1:]])
-    if len(x_ext) > 0:
-        xd = np.concatenate([xd, x_ext]); yd = np.concatenate([yd, y_ext])
-    return xd, yd, bi
-
-
-def _load_and_fit(csv_path: str, cfg: TrackerConfig) -> dict:
-    df = pd.read_csv(csv_path)
-    mask = df["x"].notna() & df["y"].notna()
-    if "status" in df.columns:
-        mask &= df["status"].isin(["det", "hsv", "detected"])
+def _load_trajectory(csv_rows: list, cfg: TrackerConfig) -> dict:
+    """Build trajectory data from in-memory CSV rows."""
+    df = pd.DataFrame(csv_rows)
+    mask = df['x'].replace('', np.nan).notna() & df['y'].replace('', np.nan).notna()
+    if 'status' in df.columns:
+        mask &= df['status'].isin(['det', 'hsv', 'detected'])
     valid = df[mask].reset_index(drop=True)
     if len(valid) < cfg.traj_min_points:
-        raise ValueError(f"Insufficient points: {len(valid)}")
-    x = valid["x"].values.astype(float)
-    y = valid["y"].values.astype(float)
-    fr = valid["frame"].values.astype(int)
+        raise ValueError(f"Need at least {cfg.traj_min_points} points, got {len(valid)}")
 
-    fr, x, y = _trim_at_gap(fr, x, y, cfg.traj_max_frame_gap)
-    if len(x) < cfg.traj_min_points:
-        raise ValueError("Too few points after gap trim")
+    x_raw  = valid['x'].values.astype(float)
+    y_raw  = valid['y'].values.astype(float)
+    frames = valid['frame'].values.astype(int)
 
-    bi = _detect_bounce(y, cfg.traj_bounce_thresh, cfg.traj_min_points)
-    co = _find_cutoff(x, y, bi, cfg.traj_angle_cutoff)
-    if bi is not None and bi > co:
-        bi = None
+    x_smooth, y_smooth, bounce_pt = _smooth_trajectory(
+        x_raw, y_raw, cfg.traj_min_points, cfg.traj_bounce_thresh)
 
-    if bi is not None:
-        cp, cq, xp, ypf, xq, yqf, xe, ye, bp = _fit_two_parabolas(x, y, bi, co, cfg)
-        xd, yd, bdi = _interp_dense(cp, cq, xp, ypf, xq, yqf, xe, ye)
-    else:
-        xu = x[:co + 1]; yu = y[:co + 1]
-        im = _ransac_filter(xu, yu, cfg.traj_ransac_iters, cfg.traj_ransac_inlier_px, cfg.traj_min_points)
-        xc = xu[im]; yc = yu[im]
-        c = _fit_parabola(xc, yc)
-        if c is not None:
-            xd = np.linspace(xc[0], xc[-1], max(len(xc) * 4, 2))
-            yd = np.polyval(c, xd)
-        else:
-            xd = xc.astype(float); yd = yc.astype(float)
-        bp = None; bdi = None
+    bounce_idx = None
+    if bounce_pt is not None:
+        dists      = (x_smooth - bounce_pt[0])**2 + (y_smooth - bounce_pt[1])**2
+        bounce_idx = int(np.argmin(dists))
 
-    pts = np.column_stack([xd, yd]).astype(np.int32)
-    bpf = None
-    if bdi is not None and bdi < len(pts):
-        bpf = (float(xd[bdi]), float(yd[bdi]))
-    elif bp is not None:
-        bpf = bp
+    cutoff  = _find_cutoff(x_smooth, y_smooth, bounce_idx, cfg.traj_angle_cutoff)
+    x_final = x_smooth[:cutoff+1]
+    y_final = y_smooth[:cutoff+1]
 
-    ymin, ymax = yd.min(), yd.max()
-    yr = ymax - ymin
-    dep = (yd - ymin) / yr if yr > 1.0 else np.full(len(yd), 0.5)
-    fru = fr[:co + 1]
-
+    pts = np.column_stack([x_final, y_final]).astype(np.int32)
     return {
-        "points": pts, "bounce": bpf, "bounce_idx": bdi,
-        "depth_values": dep,
-        "start_frame": int(fru[0]), "end_frame": int(fru[-1]),
+        'points':      pts,
+        'bounce':      bounce_pt,
+        'start_frame': int(frames[0]),
+        'end_frame':   int(frames[min(cutoff, len(frames)-1)]),
     }
 
 
 # =====================================================================
-#  RENDERING
+#  IMM SPEED ESTIMATION
 # =====================================================================
 
-def _depth_thick(d, lo, hi):
-    return max(1, int(round(lo + (hi - lo) * d)))
+def _run_imm_speed(csv_rows: list, fps: float) -> dict:
+    """Run IMM+UKF on in-memory CSV rows. Returns speed dict."""
+    df = pd.DataFrame(csv_rows)
+    df['x'] = pd.to_numeric(df['x'], errors='coerce')
+    df['y'] = pd.to_numeric(df['y'], errors='coerce')
+    mask = df['x'].notna() & df['y'].notna()
+    if 'status' in df.columns:
+        mask &= df['status'].isin(['det', 'hsv', 'detected'])
+    valid = df[mask].reset_index(drop=True)
+    if len(valid) < 5:
+        return {"imm_success": False}
+
+    cam = CameraModel()
+    obs_list = [
+        {'frame': int(r['frame']), 'u': float(r['x']), 'v': float(r['y']),
+         'status': str(r.get('status', 'det')), 'misses': int(r.get('misses', 0))}
+        for _, r in valid.iterrows()
+    ]
+
+    all_obs = {}
+    for _, row in df.iterrows():
+        fi  = int(row['frame'])
+        has = (not pd.isna(row.get('x', np.nan))
+               and str(row.get('status', '')) in ('det', 'hsv', 'detected'))
+        all_obs[fi] = {
+            'u':      float(row['x']) if has else None,
+            'v':      float(row['y']) if has else None,
+            'status': str(row.get('status', 'miss')),
+            'misses': int(row.get('misses', 0)),
+        }
+
+    x0, P0  = _init_3d_state(obs_list, cam, fps)
+    imm     = IMMFilter(cam, x0, P0, fps)
+    first_f = obs_list[0]['frame']
+    last_f  = obs_list[-1]['frame']
+    speeds, modes = [], []
+
+    for fi in range(first_f, last_f + 1):
+        o = all_obs.get(fi, {'u': None, 'v': None, 'status': 'miss', 'misses': 0})
+        if o['u'] is not None:
+            z   = np.array([o['u'], o['v']])
+            sig = _MEAS_SIGMA_DET if o['status'] == 'det' else _MEAS_SIGMA_HSV
+            R   = np.diag([sig**2, sig**2])
+        else:
+            z = None
+            R = np.diag([_MEAS_SIGMA_NONE**2] * 2)
+        imm.step(z, R, o['status'], o['misses'])
+        speeds.append(imm.speed_mps())
+        modes.append(imm.dominant_mode())
+
+    speeds = np.array(speeds) * 3.6   # m/s → km/h
+    if len(speeds) >= 5:
+        speeds = np.convolve(speeds, np.ones(5)/5, mode='same')
+
+    win     = min(8, len(speeds))
+    rel     = speeds[:win]
+    med     = np.median(rel)
+    clean   = rel[rel < 2.0 * med]
+    release = float(np.median(clean)) if len(clean) > 0 else float(med)
+    release = float(np.clip(release, 0.0, 165.0))
+
+    bounce_spd = None
+    for i, m in enumerate(modes):
+        if m == "post_bounce":
+            bounce_spd = float(speeds[i])
+            break
+
+    return {
+        "imm_success":       True,
+        "release_speed_kmh": release,
+        "bounce_speed_kmh":  bounce_spd,
+    }
 
 
-def _draw_stroke(frame, pts, depths, total, cfg):
-    for i in range(1, len(pts)):
-        d = 0.5 * (depths[i - 1] + depths[i])
-        cv2.line(frame, tuple(pts[i - 1]), tuple(pts[i]),
-                 _traj_colour(i, total, cfg),
-                 _depth_thick(d, cfg.traj_thickness_min, cfg.traj_thickness_max),
-                 cv2.LINE_AA)
+# =====================================================================
+#  OVERLAY RENDERING
+# =====================================================================
 
+def _draw_overlay(frame, traj_data, cfg: TrackerConfig, release_kmh=None, bounce_kmh=None):
+    """Draw trajectory line, bounce ring, and speed text panel."""
+    pts    = traj_data['points']
+    bounce = traj_data['bounce']
+    color  = cfg.line_color
 
-def _draw_dots(frame, pts, depths, total, cfg, step=4):
-    for i in range(0, len(pts), step):
-        cv2.circle(frame, tuple(pts[i]),
-                   _depth_thick(depths[i], cfg.traj_dot_min, cfg.traj_dot_max),
-                   _traj_colour(i, total, cfg), -1, cv2.LINE_AA)
-
-
-def _draw_bounce(frame, bp, depth, cfg):
-    if bp is None:
-        return
-    cx, cy = int(bp[0]), int(bp[1])
-    r1 = _depth_thick(depth, cfg.traj_bounce_ring_r1 // 2, cfg.traj_bounce_ring_r1)
-    r2 = _depth_thick(depth, cfg.traj_bounce_ring_r2 // 2, cfg.traj_bounce_ring_r2)
-    cv2.circle(frame, (cx, cy), r1, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.circle(frame, (cx, cy), r2, cfg.colour_bounce, 2, cv2.LINE_AA)
-    cv2.circle(frame, (cx, cy), 3, cfg.colour_bounce, -1, cv2.LINE_AA)
-
-
-def _overlay(frame, traj, cfg):
-    pts = traj["points"]; dep = traj["depth_values"]
-    bp = traj["bounce"]; bi = traj["bounce_idx"]
-    n = len(pts)
-    if n < 2:
+    if len(pts) < 2:
         return frame
-    _draw_stroke(frame, pts, dep, n, cfg)
-    _draw_dots(frame, pts, dep, n, cfg)
-    bd = dep[bi] if bi is not None and bi < len(dep) else 0.5
-    _draw_bounce(frame, bp, bd, cfg)
+
+    cv2.polylines(frame, [pts], False, color, 2, cv2.LINE_AA)
+
+    if bounce is not None:
+        cx, cy = int(bounce[0]), int(bounce[1])
+        cv2.circle(frame, (cx, cy), 12, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy),  8, color,           2, cv2.LINE_AA)
+
+    lines = []
+    if release_kmh and release_kmh > 0:
+        lines.append(f"Release: {release_kmh:.0f} km/h")
+    if bounce_kmh and bounce_kmh > 0:
+        lines.append(f"Bounce:  {bounce_kmh:.0f} km/h")
+
+    if lines:
+        font   = cv2.FONT_HERSHEY_SIMPLEX
+        sc, th = 0.9, 2
+        pad    = 10
+        line_h = cv2.getTextSize("A", font, sc, th)[0][1] + 8
+        max_w  = max(cv2.getTextSize(t, font, sc, th)[0][0] for t in lines)
+        pnl_h  = pad + len(lines) * line_h + pad
+        ov = frame.copy()
+        cv2.rectangle(ov, (pad, pad), (pad + max_w + 2*pad, pnl_h), (0, 0, 0), -1)
+        cv2.addWeighted(ov, 0.55, frame, 0.45, 0, frame)
+        for k, txt in enumerate(lines):
+            ty = pad + (k + 1) * line_h
+            cv2.putText(frame, txt, (2*pad, ty), font, sc, (255, 255, 255), th, cv2.LINE_AA)
+
     return frame
 
 
@@ -510,7 +724,6 @@ class CricketBallTracker:
         self.cfg = config or TrackerConfig()
         self._model: YOLO | None = None
 
-    # Lazy-load the YOLO model (heavy; only load once)
     def _get_model(self) -> YOLO:
         if self._model is None:
             self._model = YOLO(self.cfg.model_path)
@@ -541,7 +754,7 @@ class CricketBallTracker:
 
         Returns:
             dict with keys: detection_video, trajectory_video, csv,
-            bounce, num_detections, fps.
+            bounce, fps, release_speed_kmh, bounce_speed_kmh.
         """
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
@@ -550,25 +763,29 @@ class CricketBallTracker:
             if progress_callback:
                 progress_callback(cur, tot, msg)
 
-        # Pass 1
-        csv_path, fps = self._detection_pass(video_path, out, _cb)
+        # Pass 1 — YOLO + ByteTrack + HSV detection
+        csv_rows, fps = self._detection_pass(video_path, out, _cb)
 
-        # Pass 2
-        traj_video = None
-        bounce = None
-        if self.cfg.save_trajectory_video:
-            try:
-                traj_video, bounce = self._rendering_pass(
-                    video_path, csv_path, out, fps, _cb)
-            except ValueError as e:
-                _cb(0, 0, f"Pass 2 skipped: {e}")
+        # Pass 2 — IMM speed + parabolic trajectory + overlay rendering
+        traj_video  = None
+        bounce      = None
+        release_kmh = None
+        bounce_kmh  = None
+
+        try:
+            traj_video, bounce, release_kmh, bounce_kmh = self._rendering_pass(
+                out, csv_rows, fps, _cb)
+        except (ValueError, IOError) as e:
+            _cb(0, 0, f"Pass 2 skipped: {e}")
 
         return {
-            "detection_video": str(out / "annotated_detection.mp4"),
-            "trajectory_video": str(traj_video) if traj_video else None,
-            "csv": str(csv_path),
-            "bounce": bounce,
-            "fps": fps,
+            "detection_video":   str(out / "annotated_detection.mp4"),
+            "trajectory_video":  str(traj_video) if traj_video else None,
+            "csv":               str(out / "trajectory.csv"),
+            "bounce":            bounce,
+            "fps":               fps,
+            "release_speed_kmh": release_kmh,
+            "bounce_speed_kmh":  bounce_kmh,
         }
 
     # ------------------------------------------------------------------
@@ -580,7 +797,7 @@ class CricketBallTracker:
         tracker_yaml = out_dir / "bytetrack_custom.yaml"
         _write_bytetrack_yaml(tracker_yaml, cfg)
 
-        model = self._get_model()
+        model  = self._get_model()
         stream = model.track(
             source=video_path, imgsz=cfg.imgsz, conf=cfg.conf, iou=cfg.iou,
             device=cfg.device, classes=cfg.classes,
@@ -588,12 +805,15 @@ class CricketBallTracker:
             verbose=False, save=False,
         )
 
-        writer = None; csv_rows = []; fps = 30.0
-        active_id = None; last_pos = None
-        vel = np.array([0.0, 0.0], dtype=float)
-        misses = 0; hsv_model = None; avg_area = None
+        writer    = None
+        csv_rows  = []
+        fps       = 30.0
+        active_id = None
+        last_pos  = None
+        vel       = np.array([0.0, 0.0], dtype=float)
+        misses    = 0
+        hsv_model = None
 
-        # Count total frames for progress
         cap_tmp = cv2.VideoCapture(video_path)
         total_frames = int(cap_tmp.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
         fv = cap_tmp.get(cv2.CAP_PROP_FPS)
@@ -608,61 +828,50 @@ class CricketBallTracker:
             if frame is None:
                 continue
 
-            if writer is None and cfg.save_annotated_video:
+            if writer is None:
                 h, w = frame.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(
                     str(out_dir / "annotated_detection.mp4"), fourcc, fps, (w, h))
 
-            # Candidates
             candidates = []
             if result.boxes is not None and len(result.boxes) > 0:
                 xyxy_arr = result.boxes.xyxy.cpu().numpy()
-                confs = result.boxes.conf.cpu().numpy()
-                clss = result.boxes.cls.cpu().numpy().astype(int)
-                ids = None
+                confs    = result.boxes.conf.cpu().numpy()
+                ids      = None
                 if getattr(result.boxes, "id", None) is not None:
                     ids = result.boxes.id.cpu().numpy().astype(int)
                 for i in range(len(xyxy_arr)):
                     x1, y1, x2, y2 = xyxy_arr[i]
-                    ba = _area(x1, y1, x2, y2)
-                    if cfg.min_box_area_px > 0 and ba < cfg.min_box_area_px:
+                    if cfg.min_box_area_px > 0 and _area(x1, y1, x2, y2) < cfg.min_box_area_px:
                         continue
-                    if avg_area is not None and avg_area > 0:
-                        ratio = ba / avg_area
-                        if ratio > cfg.size_ratio_max or ratio < (1.0 / cfg.size_ratio_max):
-                            continue
                     candidates.append({
                         "xyxy": (float(x1), float(y1), float(x2), float(y2)),
                         "conf": float(confs[i]),
-                        "id": int(ids[i]) if ids is not None else None,
-                        "area": ba,
+                        "id":   int(ids[i]) if ids is not None else None,
                     })
 
-            # Prediction
             pred = None
             if last_pos is not None:
                 pred = (last_pos[0] + float(vel[0]), last_pos[1] + float(vel[1]))
 
-            # Gating
             chosen = None
-            gate = cfg.gate_radius_px + misses * cfg.gate_grow_per_miss
+            gate   = cfg.gate_radius_px + misses * cfg.gate_grow_per_miss
 
             if active_id is None:
                 if candidates:
-                    chosen = max(candidates, key=lambda d: d["conf"])
+                    chosen    = max(candidates, key=lambda d: d["conf"])
                     active_id = chosen["id"]
             else:
-                same = [d for d in candidates if d["id"] == active_id]
-                pool = same if same else candidates
+                same_id = [d for d in candidates if d["id"] == active_id]
+                pool    = same_id if same_id else candidates
                 if pool and pred is not None:
-                    scored = sorted(
-                        [(cfg and _elliptical_gate_dist(
-                            _center(*d["xyxy"]), pred, vel, gate, cfg), d)
-                         for d in pool],
-                        key=lambda t: t[0])
-                    if scored[0][0] <= 1.0:
-                        chosen = scored[0][1]
+                    best = min(pool, key=lambda d: math.hypot(
+                        _center(*d["xyxy"])[0] - pred[0],
+                        _center(*d["xyxy"])[1] - pred[1]))
+                    if math.hypot(_center(*best["xyxy"])[0] - pred[0],
+                                  _center(*best["xyxy"])[1] - pred[1]) <= gate:
+                        chosen = best
                 elif pool:
                     chosen = max(pool, key=lambda d: d["conf"])
 
@@ -674,11 +883,10 @@ class CricketBallTracker:
                     and hsv_model is not None and pred is not None):
                 fh, fw = frame.shape[:2]
                 half = int(gate + cfg.hsv_roi_pad_px)
-                r = _roi(pred[0], pred[1], half, fw, fh)
-                bb = _hsv_blob(frame, r, hsv_model, pred, cfg)
+                r    = _roi(pred[0], pred[1], half, fw, fh)
+                bb   = _hsv_blob(frame, r, hsv_model, pred, cfg)
                 if bb is not None:
-                    chosen = {"xyxy": bb, "conf": 0.0, "id": active_id,
-                              "area": _area(*bb)}
+                    chosen = {"xyxy": bb, "conf": 0.0, "id": active_id}
                     hsv_recovered = True
 
             # State update
@@ -686,26 +894,22 @@ class CricketBallTracker:
             if chosen is not None:
                 cx, cy = _center(*chosen["xyxy"])
                 if last_pos is not None:
-                    dx = cx - last_pos[0]; dy = cy - last_pos[1]
-                    if math.hypot(dx, dy) >= cfg.vel_min_disp_px:
-                        nv = np.array([dx, dy], dtype=float)
-                        vel = cfg.vel_ema_momentum * vel + (1 - cfg.vel_ema_momentum) * nv
-                last_pos = (cx, cy); misses = 0
-                status = "hsv" if hsv_recovered else "det"
+                    new_vel = np.array([cx - last_pos[0], cy - last_pos[1]], dtype=float)
+                    vel     = (1 - cfg.vel_ema_alpha) * vel + cfg.vel_ema_alpha * new_vel
+                last_pos  = (cx, cy)
+                misses    = 0
+                status    = "hsv" if hsv_recovered else "det"
                 if chosen["id"] is not None:
                     active_id = chosen["id"]
-                ba = chosen.get("area", _area(*chosen["xyxy"]))
-                avg_area = ba if avg_area is None else (
-                    cfg.size_ema_momentum * avg_area + (1 - cfg.size_ema_momentum) * ba)
             else:
                 misses += 1
-                status = "pred" if pred is not None else "miss"
+                status  = "pred" if pred is not None else "miss"
                 if misses > cfg.max_misses:
                     active_id = None; last_pos = None; vel[:] = 0.0
-                    hsv_model = None; avg_area = None; misses = 0
-                    status = "reset"
+                    hsv_model = None; misses = 0
+                    status    = "reset"
 
-            # Detection video
+            # Write detection video frame
             if writer is not None:
                 vis = frame.copy()
                 if chosen is not None:
@@ -714,15 +918,17 @@ class CricketBallTracker:
                     cv2.rectangle(vis, (bx1, by1), (bx2, by2), col, 2)
                 writer.write(vis)
 
-            if cfg.save_trajectory_csv:
-                csv_rows.append({
-                    "frame": fi, "status": status,
-                    "id": active_id if active_id is not None else "",
-                    "x": last_pos[0] if last_pos is not None else "",
-                    "y": last_pos[1] if last_pos is not None else "",
-                    "vx": float(vel[0]), "vy": float(vel[1]),
-                    "gate": gate, "misses": misses,
-                })
+            csv_rows.append({
+                "frame":  fi,
+                "status": status,
+                "id":     active_id if active_id is not None else "",
+                "x":      last_pos[0] if last_pos is not None else "",
+                "y":      last_pos[1] if last_pos is not None else "",
+                "vx":     float(vel[0]),
+                "vy":     float(vel[1]),
+                "gate":   gate,
+                "misses": misses,
+            })
 
             if fi % 10 == 0:
                 cb(fi, total_frames, "Pass 1: detecting ball")
@@ -730,32 +936,46 @@ class CricketBallTracker:
         if writer is not None:
             writer.release()
 
+        # Persist CSV for bucket upload and debugging
         csv_path = out_dir / "trajectory.csv"
-        if cfg.save_trajectory_csv and csv_rows:
+        if csv_rows:
             with csv_path.open("w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
                 w.writeheader(); w.writerows(csv_rows)
 
         cb(total_frames, total_frames, "Pass 1: complete")
-        return csv_path, fps
+        return csv_rows, fps
 
     # ------------------------------------------------------------------
-    #  Pass 2 — Trajectory fitting + rendering
+    #  Pass 2 — Speed estimation + trajectory rendering
     # ------------------------------------------------------------------
 
-    def _rendering_pass(self, video_path, csv_path, out_dir, fps, cb):
+    def _rendering_pass(self, out_dir, csv_rows, fps, cb):
         cfg = self.cfg
-        output_video = out_dir / "trajectory_output.mp4"
-        traj = _load_and_fit(str(csv_path), cfg)
 
-        cap = cv2.VideoCapture(video_path)
+        # IMM + UKF speed estimation
+        imm_res     = _run_imm_speed(csv_rows, fps)
+        release_kmh = imm_res.get("release_speed_kmh") if imm_res.get("imm_success") else None
+        bounce_kmh  = imm_res.get("bounce_speed_kmh")
+
+        # Parabolic trajectory smoothing
+        traj = _load_trajectory(csv_rows, cfg)
+
+        # Render trajectory overlay on top of the annotated detection video
+        det_path   = str(out_dir / "annotated_detection.mp4")
+        output_vid = out_dir / "trajectory_output.mp4"
+
+        cap = cv2.VideoCapture(det_path)
         if not cap.isOpened():
-            raise IOError(f"Cannot open: {video_path}")
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            raise IOError(f"Cannot open annotated video: {det_path}")
+
+        fps_v  = cap.get(cv2.CAP_PROP_FPS) or fps
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(output_video), fourcc, fps, (width, height))
+        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+
+        writer = cv2.VideoWriter(
+            str(output_vid), cv2.VideoWriter_fourcc(*"mp4v"), fps_v, (width, height))
 
         cb(0, total, "Pass 2: rendering trajectory")
         fn = 0
@@ -763,13 +983,15 @@ class CricketBallTracker:
             ret, frame = cap.read()
             if not ret:
                 break
-            if fn >= traj["start_frame"]:
-                frame = _overlay(frame, traj, cfg)
+            if fn >= traj['start_frame']:
+                _draw_overlay(frame, traj, cfg, release_kmh, bounce_kmh)
             writer.write(frame)
             fn += 1
             if fn % 10 == 0:
                 cb(fn, total, "Pass 2: rendering trajectory")
 
-        cap.release(); writer.release()
+        cap.release()
+        writer.release()
         cb(total, total, "Pass 2: complete")
-        return output_video, traj.get("bounce")
+
+        return output_vid, traj.get('bounce'), release_kmh, bounce_kmh

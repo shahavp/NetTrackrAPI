@@ -68,6 +68,8 @@ class JobStatus(BaseModel):
     csv_url: Optional[str]    = None
     detection_url: Optional[str] = None
     bounce: Optional[dict]    = None
+    release_speed_kmh: Optional[float] = None
+    bounce_speed_kmh: Optional[float]  = None
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +120,8 @@ def _public_status(job_id: str, job: dict) -> JobStatus:
         output_url=output_url,
         csv_url=csv_url,
         detection_url=detection_url,
+        release_speed_kmh=job.get("release_speed_kmh"),
+        bounce_speed_kmh=job.get("bounce_speed_kmh"),
     )
 
 

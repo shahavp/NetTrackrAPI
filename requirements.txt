@@ -16,6 +16,7 @@ pandas>=2.0.0
 lap
 onnx>=1.14.0
 onnxruntime>=1.16.0
+scipy>=1.10.0
 
 # Validation
 pydantic>=2.0.0

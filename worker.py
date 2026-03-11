@@ -126,6 +126,8 @@ def run_tracking_job(job_id: str, params: dict) -> dict:
             progress=100.0,
             message="Processing complete",
             bounce=bounce,
+            release_speed_kmh=result.get("release_speed_kmh"),
+            bounce_speed_kmh=result.get("bounce_speed_kmh"),
         )
         log.info("Job %s: complete", job_id)
         return {"job_id": job_id, "bounce": bounce}
