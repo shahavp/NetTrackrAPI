@@ -132,7 +132,7 @@ def _public_status(job_id: str, job: dict) -> JobStatus:
 @app.post("/track", response_model=JobStatus, status_code=202)
 async def track_async(
     video: UploadFile = File(...),
-    confidence_threshold: float = 0.2,
+    confidence_threshold: float = 0.15,
     gate_radius_px: int = 80,
     enable_hsv_recovery: bool = True,
     max_misses: int = 60,

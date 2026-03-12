@@ -557,12 +557,14 @@ def _find_cutoff(x, y, bounce_idx, angle_cutoff):
     return len(x) - 1
 
 
-def _load_trajectory(csv_rows: list, cfg: TrackerConfig) -> dict:
-    """Build trajectory data from in-memory CSV rows."""
-    df = pd.DataFrame(csv_rows)
-    mask = df['x'].replace('', np.nan).notna() & df['y'].replace('', np.nan).notna()
+def _load_trajectory(csv_path: str, cfg: TrackerConfig) -> dict:
+    """Load and process trajectory CSV. Identical to trajectorywriter.load_trajectory."""
+    df = pd.read_csv(csv_path)
+
+    mask = df['x'].notna() & df['y'].notna()
     if 'status' in df.columns:
         mask &= df['status'].isin(['det', 'hsv', 'detected'])
+
     valid = df[mask].reset_index(drop=True)
     if len(valid) < cfg.traj_min_points:
         raise ValueError(f"Need at least {cfg.traj_min_points} points, got {len(valid)}")
@@ -674,11 +676,10 @@ def _run_imm_speed(csv_rows: list, fps: float) -> dict:
 #  OVERLAY RENDERING
 # =====================================================================
 
-def _draw_overlay(frame, traj_data, cfg: TrackerConfig, release_kmh=None, bounce_kmh=None):
-    """Draw trajectory line, bounce ring, and speed text panel."""
+def _draw_overlay(frame, traj_data, color):
+    """Draw trajectory line and bounce marker. Identical to trajectorywriter.draw_overlay."""
     pts    = traj_data['points']
     bounce = traj_data['bounce']
-    color  = cfg.line_color
 
     if len(pts) < 2:
         return frame
@@ -689,26 +690,6 @@ def _draw_overlay(frame, traj_data, cfg: TrackerConfig, release_kmh=None, bounce
         cx, cy = int(bounce[0]), int(bounce[1])
         cv2.circle(frame, (cx, cy), 12, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.circle(frame, (cx, cy),  8, color,           2, cv2.LINE_AA)
-
-    lines = []
-    if release_kmh and release_kmh > 0:
-        lines.append(f"Release: {release_kmh:.0f} km/h")
-    if bounce_kmh and bounce_kmh > 0:
-        lines.append(f"Bounce:  {bounce_kmh:.0f} km/h")
-
-    if lines:
-        font   = cv2.FONT_HERSHEY_SIMPLEX
-        sc, th = 0.9, 2
-        pad    = 10
-        line_h = cv2.getTextSize("A", font, sc, th)[0][1] + 8
-        max_w  = max(cv2.getTextSize(t, font, sc, th)[0][0] for t in lines)
-        pnl_h  = pad + len(lines) * line_h + pad
-        ov = frame.copy()
-        cv2.rectangle(ov, (pad, pad), (pad + max_w + 2*pad, pnl_h), (0, 0, 0), -1)
-        cv2.addWeighted(ov, 0.55, frame, 0.45, 0, frame)
-        for k, txt in enumerate(lines):
-            ty = pad + (k + 1) * line_h
-            cv2.putText(frame, txt, (2*pad, ty), font, sc, (255, 255, 255), th, cv2.LINE_AA)
 
     return frame
 
@@ -958,8 +939,8 @@ class CricketBallTracker:
         release_kmh = imm_res.get("release_speed_kmh") if imm_res.get("imm_success") else None
         bounce_kmh  = imm_res.get("bounce_speed_kmh")
 
-        # Parabolic trajectory smoothing
-        traj = _load_trajectory(csv_rows, cfg)
+        # Parabolic trajectory smoothing — reads from the written CSV (identical to trajectorywriter.py)
+        traj = _load_trajectory(str(out_dir / "trajectory.csv"), cfg)
 
         # Render trajectory overlay on top of the annotated detection video
         det_path   = str(out_dir / "annotated_detection.mp4")
@@ -984,7 +965,7 @@ class CricketBallTracker:
             if not ret:
                 break
             if fn >= traj['start_frame']:
-                _draw_overlay(frame, traj, cfg, release_kmh, bounce_kmh)
+                _draw_overlay(frame, traj, cfg.line_color)
             writer.write(frame)
             fn += 1
             if fn % 10 == 0:
