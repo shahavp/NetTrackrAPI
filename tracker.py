@@ -755,7 +755,7 @@ class CricketBallTracker:
 
         try:
             traj_video, bounce, release_kmh, bounce_kmh = self._rendering_pass(
-                out, csv_rows, fps, _cb)
+                video_path, out, csv_rows, fps, _cb)
         except (ValueError, IOError) as e:
             _cb(0, 0, f"Pass 2 skipped: {e}")
 
@@ -931,7 +931,7 @@ class CricketBallTracker:
     #  Pass 2 — Speed estimation + trajectory rendering
     # ------------------------------------------------------------------
 
-    def _rendering_pass(self, out_dir, csv_rows, fps, cb):
+    def _rendering_pass(self, video_path, out_dir, csv_rows, fps, cb):
         cfg = self.cfg
 
         # IMM + UKF speed estimation
@@ -942,13 +942,12 @@ class CricketBallTracker:
         # Parabolic trajectory smoothing — reads from the written CSV (identical to trajectorywriter.py)
         traj = _load_trajectory(str(out_dir / "trajectory.csv"), cfg)
 
-        # Render trajectory overlay on top of the annotated detection video
-        det_path   = str(out_dir / "annotated_detection.mp4")
+        # Render trajectory overlay on the original input video (avoids mp4v read-back issues on Linux)
         output_vid = out_dir / "trajectory_output.mp4"
 
-        cap = cv2.VideoCapture(det_path)
+        cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            raise IOError(f"Cannot open annotated video: {det_path}")
+            raise IOError(f"Cannot open input video: {video_path}")
 
         fps_v  = cap.get(cv2.CAP_PROP_FPS) or fps
         width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))

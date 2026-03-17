@@ -79,7 +79,7 @@ def run_tracking_job(job_id: str, params: dict) -> dict:
         # ── Build a per-job config (immutable params, shared model weights) ─
         cfg = TrackerConfig(
             model_path=MODEL_PATH,
-            conf=params.get("confidence_threshold", 0.2),
+            conf=params.get("confidence_threshold", 0.15),
             gate_radius_px=params.get("gate_radius_px", 80),
             enable_hsv_recovery=params.get("enable_hsv_recovery", True),
             max_misses=params.get("max_misses", 60),
