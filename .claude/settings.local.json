@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r \"ONNX\\\\|OMP_\\\\|cv2\\\\|opencv\" c:UsersunbeaDocumentsLocalAVANEESHcricketballtrackerFastAPIcricket --include=*.py --include=Dockerfile*)"
+    ]
+  }
+}
