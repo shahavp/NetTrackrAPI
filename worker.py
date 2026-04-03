@@ -7,9 +7,9 @@ Start command (Railway worker service):
 How it works
 ------------
 * RQ forks a child process for every job (default fork worker).
-* The YOLO model is loaded once at module level in the parent process.
-  Each forked child inherits it via copy-on-write, so model weights are
-  not reloaded from disk for every job — only on cold start.
+* The YOLO/ONNX model is loaded fresh inside each forked child process.
+  This avoids ONNX Runtime thread-pool corruption that occurs when an
+  InferenceSession created in the parent is inherited across fork().
 * Each job gets its own TrackerConfig instance, so per-request parameters
   (confidence_threshold, gate_radius_px, …) never mutate shared state.
 * All file I/O goes through /tmp inside a TemporaryDirectory that is
@@ -39,15 +39,7 @@ log = logging.getLogger("cricket-worker")
 
 MODEL_PATH = os.getenv("MODEL_PATH", "cricket_yolov8/best.onnx")
 
-# ---------------------------------------------------------------------------
-#  Module-level model load (runs once in the parent worker process).
-#  RQ's fork worker inherits this via copy-on-write, so every child gets
-#  the model without paying the disk-load cost again.
-# ---------------------------------------------------------------------------
-log.info("Loading YOLO model from %s …", MODEL_PATH)
-_base_tracker = CricketBallTracker(config=TrackerConfig(model_path=MODEL_PATH))
-_base_tracker.warmup()
-log.info("Model ready — worker is listening")
+log.info("Worker ready — waiting for jobs")
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +68,22 @@ def run_tracking_job(job_id: str, params: dict) -> dict:
             _fail(job_id, f"Failed to download input: {exc}")
             raise
 
-        # ── Build a per-job config (immutable params, shared model weights) ─
+        # ── Validate downloaded video before running the pipeline ─────────
+        import cv2 as _cv2
+        _cap = _cv2.VideoCapture(str(video_in))
+        if not _cap.isOpened():
+            _cap.release()
+            _fail(job_id, "Downloaded video could not be opened by OpenCV")
+            raise RuntimeError("unreadable video")
+        _fps_probe = _cap.get(_cv2.CAP_PROP_FPS)
+        _frame_count = int(_cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+        _cap.release()
+        if _fps_probe <= 0 or _frame_count == 0:
+            _fail(job_id, f"Video has invalid FPS ({_fps_probe}) or frame count ({_frame_count})")
+            raise RuntimeError("invalid video metadata")
+        log.info("Job %s: video OK — %.1f fps, %d frames", job_id, _fps_probe, _frame_count)
+
+        # ── Build a per-job config ─────────────────────────────────────────
         cfg = TrackerConfig(
             model_path=MODEL_PATH,
             conf=params.get("confidence_threshold", 0.15),
@@ -84,9 +91,7 @@ def run_tracking_job(job_id: str, params: dict) -> dict:
             enable_hsv_recovery=params.get("enable_hsv_recovery", True),
             max_misses=params.get("max_misses", 60),
         )
-        # Reuse the already-loaded YOLO model; avoid paying disk I/O again.
         tracker = CricketBallTracker(config=cfg)
-        tracker._model = _base_tracker._model   # share loaded weights (read-only in child)
 
         jobs.update(job_id, message="Initialising tracker")
 
