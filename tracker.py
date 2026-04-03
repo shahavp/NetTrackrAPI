@@ -745,7 +745,7 @@ class CricketBallTracker:
                 progress_callback(cur, tot, msg)
 
         # Pass 1 — YOLO + ByteTrack + HSV detection
-        csv_rows, fps, boxes_by_frame = self._detection_pass(video_path, out, _cb)
+        csv_rows, fps = self._detection_pass(video_path, out, _cb)
 
         # Pass 2 — IMM speed + parabolic trajectory + overlay rendering
         traj_video  = None
@@ -755,7 +755,7 @@ class CricketBallTracker:
 
         try:
             traj_video, bounce, release_kmh, bounce_kmh = self._rendering_pass(
-                video_path, out, csv_rows, fps, boxes_by_frame, _cb)
+                video_path, out, csv_rows, fps, _cb)
         except (ValueError, IOError) as e:
             _cb(0, 0, f"Pass 2 skipped: {e}")
 
@@ -786,15 +786,14 @@ class CricketBallTracker:
             verbose=False, save=False,
         )
 
-        writer         = None
-        csv_rows       = []
-        boxes_by_frame = {}
-        fps            = 30.0
-        active_id      = None
-        last_pos       = None
-        vel            = np.array([0.0, 0.0], dtype=float)
-        misses         = 0
-        hsv_model      = None
+        writer    = None
+        csv_rows  = []
+        fps       = 30.0
+        active_id = None
+        last_pos  = None
+        vel       = np.array([0.0, 0.0], dtype=float)
+        misses    = 0
+        hsv_model = None
 
         cap_tmp = cv2.VideoCapture(video_path)
         total_frames = int(cap_tmp.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
@@ -891,9 +890,7 @@ class CricketBallTracker:
                     hsv_model = None; misses = 0
                     status    = "reset"
 
-            # Store box for rendering pass; write detection video frame
-            if chosen is not None:
-                boxes_by_frame[fi] = (chosen["xyxy"], hsv_recovered)
+            # Write detection video frame
             if writer is not None:
                 vis = frame.copy()
                 if chosen is not None:
@@ -928,13 +925,13 @@ class CricketBallTracker:
                 w.writeheader(); w.writerows(csv_rows)
 
         cb(total_frames, total_frames, "Pass 1: complete")
-        return csv_rows, fps, boxes_by_frame
+        return csv_rows, fps
 
     # ------------------------------------------------------------------
     #  Pass 2 — Speed estimation + trajectory rendering
     # ------------------------------------------------------------------
 
-    def _rendering_pass(self, video_path, out_dir, csv_rows, fps, boxes_by_frame, cb):
+    def _rendering_pass(self, video_path, out_dir, csv_rows, fps, cb):
         cfg = self.cfg
 
         # IMM + UKF speed estimation
@@ -966,11 +963,6 @@ class CricketBallTracker:
             ret, frame = cap.read()
             if not ret:
                 break
-            if fn in boxes_by_frame:
-                xyxy, hsv_rec = boxes_by_frame[fn]
-                bx1, by1, bx2, by2 = map(int, xyxy)
-                col = (0, 255, 255) if hsv_rec else (0, 255, 0)
-                cv2.rectangle(frame, (bx1, by1), (bx2, by2), col, 2)
             if fn >= traj['start_frame']:
                 _draw_overlay(frame, traj, cfg.line_color)
             writer.write(frame)
