@@ -823,7 +823,7 @@ class CricketBallTracker:
             _cb(0, 0, f"Pass 2 skipped: {e}")
 
         return {
-            "detection_video":   str(out / "annotated_detection.mp4"),
+            "detection_video":   None,
             "trajectory_video":  str(traj_video) if traj_video else None,
             "csv":               str(out / "trajectory.csv"),
             "bounce":            bounce,
@@ -849,7 +849,6 @@ class CricketBallTracker:
             verbose=False, save=False,
         )
 
-        writer        = None
         csv_rows      = []
         boxes_by_frame = {}
         fps           = 30.0
@@ -872,12 +871,6 @@ class CricketBallTracker:
             frame = result.orig_img
             if frame is None:
                 continue
-
-            if writer is None:
-                h, w = frame.shape[:2]
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(
-                    str(out_dir / "annotated_detection.mp4"), fourcc, fps, (w, h))
 
             candidates = []
             if result.boxes is not None and len(result.boxes) > 0:
@@ -958,15 +951,6 @@ class CricketBallTracker:
             if chosen is not None:
                 boxes_by_frame[fi] = (chosen["xyxy"], hsv_recovered)
 
-            # Write detection video frame
-            if writer is not None:
-                vis = frame.copy()
-                if chosen is not None:
-                    bx1, by1, bx2, by2 = map(int, chosen["xyxy"])
-                    col = (0, 255, 255) if hsv_recovered else (0, 255, 0)
-                    cv2.rectangle(vis, (bx1, by1), (bx2, by2), col, 2)
-                writer.write(vis)
-
             csv_rows.append({
                 "frame":  fi,
                 "status": status,
@@ -981,9 +965,6 @@ class CricketBallTracker:
 
             if fi % 10 == 0:
                 cb(fi, total_frames, "Pass 1: detecting ball")
-
-        if writer is not None:
-            writer.release()
 
         # Persist CSV for bucket upload and debugging
         csv_path = out_dir / "trajectory.csv"

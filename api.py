@@ -105,9 +105,8 @@ def _public_status(job_id: str, job: dict) -> JobStatus:
     output_url = csv_url = detection_url = None
     if job.get("status") == "completed":
         try:
-            output_url    = storage.presigned_download_url(storage.output_key(job_id, "trajectory.mp4"))
-            csv_url       = storage.presigned_download_url(storage.output_key(job_id, "trajectory.csv"))
-            detection_url = storage.presigned_download_url(storage.output_key(job_id, "detection.mp4"))
+            output_url = storage.presigned_download_url(storage.output_key(job_id, "trajectory.mp4"))
+            csv_url    = storage.presigned_download_url(storage.output_key(job_id, "trajectory.csv"))
         except Exception as exc:
             log.warning("Job %s: could not generate presigned URLs — %s", job_id, exc)
 

@@ -144,7 +144,6 @@ def run_tracking_job(job_id: str, params: dict) -> dict:
 
 _OUTPUT_MAP = [
     ("trajectory_output.mp4", "trajectory.mp4"),
-    ("annotated_detection.mp4", "detection.mp4"),
     ("trajectory.csv", "trajectory.csv"),
 ]
 
