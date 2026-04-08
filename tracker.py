@@ -660,6 +660,8 @@ def _load_trajectory(csv_path: str, cfg: TrackerConfig) -> dict:
 def _run_imm_speed(csv_rows: list, fps: float) -> dict:
     """Run IMM+UKF on in-memory CSV rows. Returns speed dict."""
     df = pd.DataFrame(csv_rows)
+    if df.empty or 'x' not in df.columns:
+        return {"imm_success": False}
     df['x'] = pd.to_numeric(df['x'], errors='coerce')
     df['y'] = pd.to_numeric(df['y'], errors='coerce')
     mask = df['x'].notna() & df['y'].notna()
@@ -819,7 +821,7 @@ class CricketBallTracker:
         try:
             traj_video, bounce, release_kmh = self._rendering_pass(
                 video_path, out, csv_rows, fps, boxes_by_frame, _cb)
-        except (ValueError, IOError) as e:
+        except Exception as e:
             _cb(0, 0, f"Pass 2 skipped: {e}")
 
         return {
@@ -966,12 +968,14 @@ class CricketBallTracker:
             if fi % 10 == 0:
                 cb(fi, total_frames, "Pass 1: detecting ball")
 
-        # Persist CSV for bucket upload and debugging
+        # Persist CSV for bucket upload and debugging — always write, even with zero rows
+        _CSV_FIELDS = ["frame", "status", "id", "x", "y", "vx", "vy", "gate", "misses"]
         csv_path = out_dir / "trajectory.csv"
-        if csv_rows:
-            with csv_path.open("w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
-                w.writeheader(); w.writerows(csv_rows)
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            fields = list(csv_rows[0].keys()) if csv_rows else _CSV_FIELDS
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(csv_rows)
 
         cb(total_frames, total_frames, "Pass 1: complete")
         return csv_rows, fps, boxes_by_frame

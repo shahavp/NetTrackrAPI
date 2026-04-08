@@ -45,9 +45,9 @@ The system is split into five Railway services that communicate exclusively thro
 │  Redis           │          │  Railway Bucket  (S3-compatible)     │
 │  job:{id} JSON   │          │  uploads/{job_id}.mp4                │
 │  TTL = 30 min    │          │  outputs/{job_id}/trajectory.mp4     │
-│  "tracking" queue│          │  outputs/{job_id}/detection.mp4      │
-└──────┬───────────┘          │  outputs/{job_id}/trajectory.csv     │
-       │ BLPOP                └──────────────────────────────────────┘
+│  "tracking" queue│          │  outputs/{job_id}/trajectory.csv     │
+└──────┬───────────┘          └──────────────────────────────────────┘
+       │ BLPOP
 ┌──────▼───────────────────────────────────────────────────────────────┐
 │  Worker Service  (Dockerfile.worker, 1 replica)                      │
 │  RQ worker — forks one child process per job                         │
@@ -119,34 +119,43 @@ boto3>=1.34.0             # Railway Bucket (S3-compatible)
 | `task_queue.py` | RQ enqueue wrapper |
 | `storage.py` | S3 client (upload, download, presigned URLs) |
 
-### 3.4 Upload Validation (`api.py:_validate_upload`)
+### 3.4 Upload Validation
 
-Two checks run synchronously before any storage operation:
-1. **File extension** must be in `{".mp4", ".avi", ".mov", ".mkv", ".webm"}`
-2. **File size** must not exceed `MAX_UPLOAD_MB` (default 100 MB, overrideable via env var)
+Three checks run before any storage operation:
 
-Violations return HTTP 400 or 413 immediately.
+1. **File extension** (`_validate_upload`) — must be in `{".mp4", ".avi", ".mov", ".mkv", ".webm"}` → HTTP 400 on failure
+2. **File size** (`_validate_upload`) — must not exceed `MAX_UPLOAD_MB` (default 100 MB) → HTTP 413 on failure
+3. **Magic-byte content check** (async, in `POST /track`) — reads the first 12 bytes of the upload stream and verifies they match a known video container signature:
+   - `RIFF....` → AVI
+   - `\x1a\x45\xdf\xa3` → MKV / WEBM
+   - `????ftyp` / `????mdat` / `????moov` / `????free` / `????skip` → MP4 / MOV (ISO base media)
+   - Mismatch → HTTP 422 (catches PDF-as-.mp4, images, etc.)
+   - Empty upload (zero bytes read) → HTTP 422
+
+After the magic-byte read the stream is rewound (`seek(0)`) so boto3 receives the complete file for S3 upload.
 
 ### 3.5 `POST /track` — Full Workflow
 
 ```
 1. _validate_upload(filename, size)            → HTTP 400/413 on failure
-2. job_id = uuid4()
-3. storage.upload_fileobj(video.file,
+2. await video.read(12) + seek(0)              → HTTP 422 if empty or non-video magic bytes
+3. job_id = uuid4()
+4. storage.upload_fileobj(video.file,
        upload_key(job_id))                     → streams to Bucket, no RAM buffer
-4. jobs.create(job_id, {status:"pending", …}) → Redis SETEX with 30-min TTL
-5. q.enqueue_tracking_job(job_id, params)      → Redis RPUSH on "tracking" queue
-6. return _public_status(job_id, jobs.get(job_id))  → HTTP 202 JobStatus
+5. jobs.create(job_id, {status:"pending", …}) → Redis SETEX with 30-min TTL
+6. q.enqueue_tracking_job(job_id, params)      → Redis RPUSH on "tracking" queue
+7. return _public_status(job_id, jobs.get(job_id))  → HTTP 202 JobStatus
 ```
 
-The video is **never buffered in API process RAM** — `upload_fileobj` uses boto3's multipart streaming directly from the HTTP request body to the bucket.
+The video is **never buffered in API process RAM** — the 12-byte header read is negligible, and `upload_fileobj` uses boto3's multipart streaming directly from the HTTP request body to the bucket.
 
 ### 3.6 Presigned URL Generation (`api.py:_public_status`)
 
-Called on every `GET /status/{job_id}` and on the `POST /track` response. When `status == "completed"`, generates three 15-minute presigned S3 GET URLs:
+Called on every `GET /status/{job_id}` and on the `POST /track` response. When `status == "completed"`, generates two 15-minute presigned S3 GET URLs:
 - `trajectory.mp4` → `output_url`
 - `trajectory.csv` → `csv_url`
-- `detection.mp4` → `detection_url`
+
+`detection_url` is always `null` — the detection video is no longer produced (see §6.3.3).
 
 URL generation failures are non-fatal (logged as warnings); the status response still returns with null URL fields.
 
@@ -191,8 +200,9 @@ pydantic>=2.0.0
 
 RQ calls `os.fork()` for every job. The child process inherits the parent's entire memory space. To prevent ONNX Runtime thread-pool corruption across fork boundaries:
 
-1. **No module-level model preloading** — `worker.py` creates NO `CricketBallTracker` at import time. Each job's forked child loads a fresh `YOLO` instance with a fresh `InferenceSession`.
-2. **`OMP_NUM_THREADS=1`** is set in `Dockerfile.worker` — forces ONNX Runtime to single-threaded mode before any session is ever created, eliminating all thread-pool state that could corrupt across fork.
+1. **No module-level model preloading** — `worker.py` creates NO `CricketBallTracker` at import time. Each job's forked child loads a fresh `YOLO` instance with a fresh `InferenceSession`. Because no ONNX session is ever created in the parent process, there is no thread-pool state to corrupt across fork.
+
+`OMP_NUM_THREADS` is intentionally **not set** — allowing ONNX Runtime to use all available CPU threads in each child process for full inference throughput.
 
 ### 4.4 `run_tracking_job(job_id, params)` — Complete Execution Flow
 
@@ -217,7 +227,7 @@ with TemporaryDirectory() as tmpdir:
     # 4. Build per-job TrackerConfig (fresh, no shared state)
     cfg = TrackerConfig(
         model_path=MODEL_PATH,
-        conf=params.get("confidence_threshold", 0.15),
+        conf=params.get("confidence_threshold", 0.20),
         gate_radius_px=params.get("gate_radius_px", 80),
         enable_hsv_recovery=params.get("enable_hsv_recovery", True),
         max_misses=params.get("max_misses", 60),
@@ -230,7 +240,6 @@ with TemporaryDirectory() as tmpdir:
     # 6. Upload outputs to Bucket
     _upload_outputs(job_id, out_dir)
     # Uploads: trajectory_output.mp4 → trajectory.mp4
-    #          annotated_detection.mp4 → detection.mp4
     #          trajectory.csv → trajectory.csv
 
     # 7. Delete raw upload (no longer needed)
@@ -238,8 +247,14 @@ with TemporaryDirectory() as tmpdir:
 
     # 8. Finalise job state
     jobs.update(job_id, status="completed", progress=100.0,
-                bounce=bounce, release_speed_kmh=..., bounce_speed_kmh=None)
+                bounce=bounce,
+                release_speed_kmh=_safe_float(result.get("release_speed_kmh")),
+                bounce_speed_kmh=_safe_float(result.get("bounce_speed_kmh")))
 ```
+
+**`_safe_float`:** Converts any `NaN` or `±inf` float to `None` before passing to `jobs.update`. Prevents degenerate IMM outputs from producing non-standard JSON tokens (`NaN`) in Redis that would cause `json.loads` to fail on the next poll.
+
+**Bounce extraction:** Uses `if result.get("bounce") is not None:` (not a bare truth-check) to safely handle numpy arrays returned by `_smooth_trajectory`. A bare `if arr:` raises `ValueError` for multi-element numpy arrays.
 
 **Error handling:** Any exception in steps 2–6 calls `_fail(job_id, message)` which sets `status="failed"` in Redis and re-raises, causing RQ to mark the job as failed.
 
@@ -264,6 +279,8 @@ with TemporaryDirectory() as tmpdir:
 | `exists(job_id)` | `EXISTS key` → bool |
 
 **TTL preservation on update:** The remaining TTL is read via `PTTL` before writing, and floored at 60 seconds. This prevents rapid successive updates from silently shrinking the job's lifetime.
+
+**NaN safety (`_safe_dumps`):** All writes (`create`, `update`) go through `_safe_dumps` which calls `json.dumps(data, allow_nan=False)`. If that raises (because a NaN or inf float slipped through from the ML pipeline), non-finite floats are coerced to `null` and the dump is retried. This ensures Redis never stores the non-standard JSON tokens `NaN` or `Infinity`, which would cause `json.loads` to fail on the next read.
 
 **Job state fields:**
 
@@ -303,8 +320,7 @@ All operations use a fresh `boto3.client("s3", ...)` per call (stateless, safe f
 | Key pattern | Contents | Lifetime |
 |---|---|---|
 | `uploads/{job_id}.mp4` | Raw client upload | Deleted by worker after download |
-| `outputs/{job_id}/trajectory.mp4` | Trajectory overlay video | Until job TTL expires (cleaned by cron) |
-| `outputs/{job_id}/detection.mp4` | Detection-annotated video | Until job TTL expires |
+| `outputs/{job_id}/trajectory.mp4` | Trajectory overlay video (with detection boxes) | Until job TTL expires (cleaned by cron) |
 | `outputs/{job_id}/trajectory.csv` | Per-frame tracking CSV | Until job TTL expires |
 
 **Presigned URLs:** 15-minute expiry (configurable via `PRESIGN_EXPIRES_SECONDS`). Generated only when status is `completed`.
@@ -334,7 +350,7 @@ The cron uses the **same Docker image as the API** (`Dockerfile.api`) since it o
 |---|---|---|
 | `model_path` | `"cricket_yolov8/best.onnx"` | ONNX model weights path |
 | `imgsz` | 1280 | YOLO input resolution (px) — must match training resolution |
-| `conf` | 0.15 | YOLO detection confidence threshold |
+| `conf` | 0.20 | YOLO detection confidence threshold |
 | `iou` | 0.7 | YOLO NMS IoU threshold |
 | `device` | `None` | Inference device (`"cpu"`, `"cuda:0"`, or auto) |
 | `classes` | `[0]` | YOLO class filter — class 0 = cricket ball |
@@ -460,9 +476,7 @@ Each frame produces one CSV row and one entry in `boxes_by_frame`:
 
 **`boxes_by_frame`:** `{frame_index → (xyxy_tuple, hsv_recovered_bool)}` — used by Pass 2 to re-draw bounding boxes without re-reading the annotated detection video.
 
-**Detection video** (`annotated_detection.mp4`): written using mp4v codec. Green box = YOLO detection, cyan box = HSV recovery.
-
-**CSV file** (`trajectory.csv`): written to disk for bucket upload and Pass 2 consumption.
+**CSV file** (`trajectory.csv`): always written to disk for bucket upload and Pass 2 consumption — even when zero detections occurred (headers-only in that case). Hardcoded fieldnames `["frame", "status", "id", "x", "y", "vx", "vy", "gate", "misses"]` are used when `csv_rows` is empty.
 
 ---
 
@@ -474,6 +488,8 @@ Each frame produces one CSV row and one entry in `boxes_by_frame`:
 #### 6.3.1 IMM+UKF Speed Estimation (`_run_imm_speed`)
 
 This sub-pipeline operates on the in-memory `csv_rows` list. It models the ball's 3D trajectory using a 2-mode Interacting Multiple Model (IMM) filter, each mode running an Unscented Kalman Filter (UKF).
+
+**Early exit guard:** If `csv_rows` is empty or the resulting DataFrame has no `x`/`y` columns (e.g. the YOLO loop exited immediately with zero frames), the function returns `{"imm_success": False}` immediately without running UKF. If fewer than 5 `det`/`hsv` rows remain after filtering, the same early-exit is taken.
 
 **Camera model (`CameraModel`):**
 
@@ -609,8 +625,8 @@ def process_video(video_path, output_dir, progress_callback=None) -> dict:
     try:
         traj_video, bounce, release_kmh = self._rendering_pass(
             video_path, out, csv_rows, fps, boxes_by_frame, _cb)
-    except (ValueError, IOError) as e:
-        _cb(0, 0, f"Pass 2 skipped: {e}")   # silently skips if < 5 valid detections
+    except Exception as e:
+        _cb(0, 0, f"Pass 2 skipped: {e}")   # skips rendering for any error (< 5 pts, KeyError, etc.)
 
     return {
         "detection_video":   str(out / "annotated_detection.mp4"),
@@ -701,7 +717,7 @@ Upload a video for asynchronous tracking.
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `video` | file | Yes | — | Video file (.mp4, .avi, .mov, .mkv, .webm), max 100 MB |
-| `confidence_threshold` | float | No | 0.15 | YOLO detection confidence |
+| `confidence_threshold` | float | No | 0.20 | YOLO detection confidence |
 | `gate_radius_px` | int | No | 80 | Euclidean gate radius (pixels) |
 | `enable_hsv_recovery` | bool | No | true | Enable HSV blob recovery on YOLO miss |
 | `max_misses` | int | No | 60 | Reset threshold for consecutive misses |
@@ -724,8 +740,9 @@ Upload a video for asynchronous tracking.
 ```
 
 **Error responses:**
-- `400` — unsupported file format
+- `400` — unsupported file extension
 - `413` — file exceeds `MAX_UPLOAD_MB`
+- `422` — empty file, or file content does not match a supported video container
 - `500` — S3 upload failure
 
 ---
@@ -744,7 +761,7 @@ Poll job progress. When `status == "completed"`, includes 15-minute presigned do
   "message": "Processing complete",
   "output_url": "https://bucket.railway.app/outputs/.../trajectory.mp4?X-Amz-...",
   "csv_url": "https://bucket.railway.app/outputs/.../trajectory.csv?X-Amz-...",
-  "detection_url": "https://bucket.railway.app/outputs/.../detection.mp4?X-Amz-...",
+  "detection_url": null,
   "bounce": {"x": 342.0, "y": 618.0},
   "release_speed_kmh": 128.4,
   "bounce_speed_kmh": null
@@ -772,7 +789,7 @@ Redirect (302) to presigned URL for `trajectory.csv`.
 
 ### `GET /download/{job_id}/detection`
 
-Redirect (302) to presigned URL for `annotated_detection.mp4`.
+**Deprecated — always returns 404.** The detection video (`annotated_detection.mp4`) is no longer produced; detection bounding boxes are drawn directly onto `trajectory_output.mp4` via `boxes_by_frame`. This endpoint remains in the router for backwards compatibility but will never find an object in the bucket.
 
 ---
 
@@ -780,7 +797,7 @@ Redirect (302) to presigned URL for `annotated_detection.mp4`.
 
 Delete job state from Redis and all associated bucket objects.
 
-**Deleted objects:** `trajectory.mp4`, `detection.mp4`, `trajectory.csv`, `uploads/{job_id}.mp4`
+**Deleted objects:** `trajectory.mp4`, `trajectory.csv`, `uploads/{job_id}.mp4`
 
 **Response:** `{"detail": "deleted"}`
 **Error:** `404` — job not found
@@ -813,7 +830,7 @@ class JobStatus(BaseModel):
     message: Optional[str]         # human-readable phase
     output_url: Optional[str]      # presigned trajectory.mp4 URL
     csv_url: Optional[str]         # presigned trajectory.csv URL
-    detection_url: Optional[str]   # presigned detection.mp4 URL
+    detection_url: Optional[str]   # always null — detection video no longer produced
     bounce: Optional[dict]         # {x: float, y: float} in pixels
     release_speed_kmh: Optional[float]
     bounce_speed_kmh: Optional[float]
@@ -859,8 +876,7 @@ uploads/
 
 outputs/
   {job_id}/
-    trajectory.mp4       ← trajectory overlay + detection boxes
-    detection.mp4        ← detection-annotated video only
+    trajectory.mp4       ← trajectory overlay + detection boxes (boxes_by_frame)
     trajectory.csv       ← per-frame tracking data
 ```
 
@@ -885,7 +901,6 @@ Size:       ≈ 150 MB
 Base:       python:3.11-slim
 System:     libgl1, libglib2.0-0t64, libsm6, libxext6, libxrender-dev,
             libgomp1, ffmpeg
-Env:        OMP_NUM_THREADS=1 (ONNX thread safety across fork)
 Deps:       torch (CPU), torchvision, ultralytics, opencv-python-headless,
             numpy, pandas, lap, onnx, onnxruntime, scipy, redis, rq, boto3
 Code:       tracker.py, worker.py, jobs.py, storage.py
@@ -895,7 +910,7 @@ Cmd:        rq worker --url $REDIS_URL --with-scheduler tracking
 Size:       ≈ 2 GB
 ```
 
-**Why `OMP_NUM_THREADS=1`:** ONNX Runtime creates an internal CPU thread pool on first `InferenceSession` creation. After `os.fork()`, child processes inherit the parent's memory state but thread handles become invalid. Setting this to 1 before any session is created eliminates the thread pool entirely, making ONNX safe to use in forked children.
+**ONNX fork safety:** No `InferenceSession` is created in the parent process (no module-level model preload in `worker.py`). Each forked child creates its own session from scratch, so there is no thread-pool state to corrupt. `OMP_NUM_THREADS` is left unset so ONNX Runtime uses all available CPU threads for full inference throughput.
 
 ---
 
@@ -923,7 +938,6 @@ Size:       ≈ 2 GB
 | `REDIS_URL` | Railway reference | — | Redis connection URL |
 | `BUCKET_*` | Railway reference | — | Same as API |
 | `MODEL_PATH` | manual | `cricket_yolov8/best.onnx` | ONNX model path inside container |
-| `OMP_NUM_THREADS` | Dockerfile | `1` | ONNX OpenMP thread count |
 | `WORKER_JOB_TIMEOUT` | manual | 1800 | Max seconds RQ allows per job |
 | `JOB_TTL_SECONDS` | manual | 1800 | RQ result TTL |
 

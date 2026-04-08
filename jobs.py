@@ -11,6 +11,7 @@ Keys
 """
 
 import json
+import math
 import os
 import time
 
@@ -28,6 +29,18 @@ def _key(job_id: str) -> str:
     return f"job:{job_id}"
 
 
+def _safe_dumps(data: dict) -> str:
+    """json.dumps with NaN/inf → null coercion. Prevents malformed Redis JSON."""
+    try:
+        return json.dumps(data, allow_nan=False)
+    except (TypeError, ValueError):
+        sanitised = {
+            k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+            for k, v in data.items()
+        }
+        return json.dumps(sanitised, allow_nan=False)
+
+
 # ---------------------------------------------------------------------------
 #  CRUD
 # ---------------------------------------------------------------------------
@@ -35,7 +48,7 @@ def _key(job_id: str) -> str:
 def create(job_id: str, data: dict) -> None:
     """Persist a new job dict with full TTL."""
     data = {**data, "_created": time.time()}
-    _r().setex(_key(job_id), JOB_TTL, json.dumps(data))
+    _r().setex(_key(job_id), JOB_TTL, _safe_dumps(data))
 
 
 def get(job_id: str) -> dict | None:
@@ -55,7 +68,7 @@ def update(job_id: str, **fields) -> None:
     data.update(fields)
     ttl = r.ttl(key)
     # Keep at least 60 s so a rapid update just after creation doesn't shrink TTL
-    r.setex(key, max(ttl, 60), json.dumps(data))
+    r.setex(key, max(ttl, 60), _safe_dumps(data))
 
 
 def delete(job_id: str) -> None:

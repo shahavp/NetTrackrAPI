@@ -55,6 +55,22 @@ log = logging.getLogger("cricket-api")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
 VALID_EXT     = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
+# Video magic-byte signatures for content-type validation
+_VIDEO_MAGIC = (
+    b"RIFF",              # AVI
+    b"\x1a\x45\xdf\xa3",  # MKV / WEBM
+)
+
+
+def _is_video_bytes(header: bytes) -> bool:
+    """Return True if the first bytes look like a video container."""
+    if header[:4] in _VIDEO_MAGIC:
+        return True
+    # MP4 / MOV: ISO box with 'ftyp', 'mdat', 'moov', 'free', or 'skip' type at offset 4
+    if len(header) >= 8 and header[4:8] in (b"ftyp", b"mdat", b"moov", b"free", b"skip"):
+        return True
+    return False
+
 # ---------------------------------------------------------------------------
 #  Pydantic models
 # ---------------------------------------------------------------------------
@@ -142,6 +158,14 @@ async def track_async(
     Download URLs are included in the status response once processing completes.
     """
     _validate_upload(video.filename or "upload.mp4", video.size or 0)
+
+    # Read magic bytes to catch empty files and non-video content (e.g. PDF renamed .mp4)
+    header = await video.read(12)
+    await video.seek(0)
+    if not header:
+        raise HTTPException(422, "Uploaded file is empty")
+    if not _is_video_bytes(header):
+        raise HTTPException(422, "File content does not appear to be a supported video format")
 
     job_id = str(uuid.uuid4())
 

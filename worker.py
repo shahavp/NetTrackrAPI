@@ -23,6 +23,7 @@ Environment variables
 """
 
 import logging
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -38,6 +39,13 @@ logging.basicConfig(
 log = logging.getLogger("cricket-worker")
 
 MODEL_PATH = os.getenv("MODEL_PATH", "cricket_yolov8/best.onnx")
+
+
+def _safe_float(v):
+    """Return None for NaN/inf so json.dumps stays RFC-compliant."""
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    return v
 
 log.info("Worker ready — waiting for jobs")
 
@@ -121,7 +129,7 @@ def run_tracking_job(job_id: str, params: dict) -> dict:
 
         # ── Finalise job state ────────────────────────────────────────────
         bounce = None
-        if result.get("bounce"):
+        if result.get("bounce") is not None:
             bx, by = result["bounce"]
             bounce = {"x": float(bx), "y": float(by)}
 
@@ -131,8 +139,8 @@ def run_tracking_job(job_id: str, params: dict) -> dict:
             progress=100.0,
             message="Processing complete",
             bounce=bounce,
-            release_speed_kmh=result.get("release_speed_kmh"),
-            bounce_speed_kmh=result.get("bounce_speed_kmh"),
+            release_speed_kmh=_safe_float(result.get("release_speed_kmh")),
+            bounce_speed_kmh=_safe_float(result.get("bounce_speed_kmh")),
         )
         log.info("Job %s: complete", job_id)
         return {"job_id": job_id, "bounce": bounce}
